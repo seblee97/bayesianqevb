@@ -82,6 +82,39 @@ class NormalGamma:
         return float(self.mu + self.scale * stats.t.rvs(df=self.df))
 
     # ------------------------------------------------------------------
+    # Mixture collapse
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def collapse_mixture(components: list[tuple[float, "NormalGamma"]]) -> "NormalGamma":
+        """Collapse a weighted mixture of NormalGamma distributions to a single one
+        via moment matching.
+
+        When all components come from a single .update() call on the same prior (as in
+        the mixture Q-update), they share lam and alpha, so only mu and beta vary.
+
+        The collapsed beta uses the law of total variance:
+            beta_new = E[beta_k] + (alpha - 1) * lam * Var[mu_k]
+        which preserves the marginal variance of the mixture in the new single NG.
+        """
+        weights = np.asarray([w for w, _ in components], dtype=float)
+        weights /= weights.sum()
+        ngs = [ng for _, ng in components]
+
+        # lam and alpha are identical across components (same prior, one update each)
+        lam_new   = ngs[0].lam
+        alpha_new = ngs[0].alpha
+
+        mu_new = float(np.dot(weights, [ng.mu for ng in ngs]))
+
+        beta_within  = float(np.dot(weights, [ng.beta for ng in ngs]))
+        beta_between = float(np.dot(weights, [(ng.mu - mu_new) ** 2 for ng in ngs]))
+        # (alpha - 1) * lam converts variance units to beta units; clamped at 0
+        beta_new = beta_within + max(alpha_new - 1.0, 0.0) * lam_new * beta_between
+
+        return NormalGamma(mu=mu_new, lam=lam_new, alpha=alpha_new, beta=beta_new)
+
+    # ------------------------------------------------------------------
     # Option-pricing helpers used for VPI
     # ------------------------------------------------------------------
 
@@ -175,10 +208,14 @@ class BayesianQLearning:
         lam0: float = 1.0,
         alpha0: float = 1.0,
         beta0: float = 1.0,
+        use_mixture_update: bool = False,
+        n_mixture_samples: int = 500,
     ):
         self.n_states = n_states
         self.n_actions = n_actions
         self.gamma = gamma
+        self.use_mixture_update = use_mixture_update
+        self.n_mixture_samples = n_mixture_samples
 
         prior = NormalGamma(mu=mu0, lam=lam0, alpha=alpha0, beta=beta0)
         self._q: list[list[NormalGamma]] = [
@@ -232,12 +269,47 @@ class BayesianQLearning:
         next_state: int,
         done: bool,
     ) -> None:
-        """Bayesian update of the Normal-Gamma posterior for Q(state, action)."""
+        """Bayesian update of the Normal-Gamma posterior for Q(state, action).
+
+        Standard mode (use_mixture_update=False): moment-matching — treats
+        max_a' E[Q(s',a')] as a fixed scalar target.
+
+        Mixture mode (use_mixture_update=True): accounts for uncertainty over
+        which action is truly best at next_state (Theorem 3.5, Dearden et al. 1998).
+        For each possible best action a' (weighted by P(a' is best), estimated via
+        Monte Carlo), a separate NG update is computed; the resulting mixture is
+        collapsed back to a single NG via moment matching.
+        """
         if done:
-            target = reward
-        else:
+            self._q[state][action] = self._q[state][action].update(reward)
+            return
+
+        if not self.use_mixture_update:
             target = reward + self.gamma * float(np.max(self.q_means(next_state)))
-        self._q[state][action] = self._q[state][action].update(target)
+            self._q[state][action] = self._q[state][action].update(target)
+        else:
+            # Estimate P(a' is best at next_state) by sampling from each posterior.
+            # Draw all samples for each action at once (one batched call vs n_samples*n_actions).
+            q_samples = np.column_stack([
+                ng.mu + ng.scale * np.random.standard_t(ng.df, size=self.n_mixture_samples)
+                for ng in (self._q[next_state][a] for a in range(self.n_actions))
+            ])  # (n_mixture_samples, n_actions)
+            best_counts = np.bincount(
+                np.argmax(q_samples, axis=1), minlength=self.n_actions
+            )
+            weights = best_counts / self.n_mixture_samples
+
+            # One NG update per possible best action, weighted by its probability
+            ng = self._q[state][action]
+            components = []
+            for a_prime in range(self.n_actions):
+                w = weights[a_prime]
+                if w < 1e-9:
+                    continue
+                target = reward + self.gamma * self._q[next_state][a_prime].mean
+                components.append((w, ng.update(target)))
+
+            self._q[state][action] = NormalGamma.collapse_mixture(components)
 
     # ------------------------------------------------------------------
     # Convenience

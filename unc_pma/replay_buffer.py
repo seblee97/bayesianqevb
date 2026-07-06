@@ -6,7 +6,7 @@ from typing import Callable, NamedTuple, Protocol, TYPE_CHECKING
 import numpy as np
 
 if TYPE_CHECKING:
-    from bayesian_qlearning import BayesianQLearning
+    from unc_pma.bayesian_qlearning import BayesianQLearning
 
 
 class Experience(NamedTuple):
