@@ -16,6 +16,9 @@ class Experience(NamedTuple):
     next_state: int
     done: bool
 
+class StateAction(NamedTuple):
+    state: int
+    action: int
 
 class ReplayBuffer:
     """Circular replay buffer storing (s, a, r, s', done) transitions.
