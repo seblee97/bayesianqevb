@@ -2,3 +2,5 @@
 *__pycache__/
 *.pyc
 .claude
+papers
+.DS_Store

@@ -108,6 +108,8 @@ class NoisyGridworld(Environment):
         slip_prob: float = 0.1,
         reward_noise: float = 0.1,
         step_cost: float = 0.01,
+        random_start: bool = False,
+        reward_noise_at_goal_only: bool = False,
     ):
         self.height = height
         self.width = width
@@ -117,31 +119,51 @@ class NoisyGridworld(Environment):
         self.slip_prob = slip_prob
         self.reward_noise = reward_noise
         self.step_cost = step_cost
+        self.random_start = random_start
+        self.reward_noise_at_goal_only = reward_noise_at_goal_only
         self._pos: Tuple[int, int] = start
 
     # ------------------------------------------------------------------
     def reset(self) -> int:
-        self._pos = self.start
+        if self.random_start:
+            self._pos = self.valid_states[np.random.randint(len(self.valid_states))]
+        else:
+            self._pos = self.start
         return self._encode(*self._pos)
+
+    def deterministic_transition(self, state: int, action: int) -> Tuple[int, float, bool]:
+        """Pure, noise-free (next_state, base_reward, done) for (state, action).
+
+        Ignores slip and reward noise; does not touch the environment's
+        current position. Used to build a full transition/reward model
+        ahead of time (matching Mattar & Daw's exhaustive "pre-explore"
+        step), where every (state, action) pair is queried directly
+        without physically visiting it.
+        """
+        r, c = self._decode(state)
+        dr, dc = self._DELTAS[action]
+        nr, nc = r + dr, c + dc
+
+        if not (0 <= nr < self.height and 0 <= nc < self.width) or (nr, nc) in self.walls:
+            nr, nc = r, c
+
+        done = (nr, nc) in self.goals
+        base_reward = self.goals.get((nr, nc), -self.step_cost)
+        return self._encode(nr, nc), base_reward, done
 
     def step(self, action: int) -> Tuple[int, float, bool, dict]:
         if np.random.random() < self.slip_prob:
             action = int(np.random.randint(4))
 
-        dr, dc = self._DELTAS[action]
-        r, c = self._pos
-        nr, nc = r + dr, c + dc
+        state = self._encode(*self._pos)
+        next_state, base_reward, done = self.deterministic_transition(state, action)
+        self._pos = self._decode(next_state)
 
-        if (0 <= nr < self.height and 0 <= nc < self.width
-                and (nr, nc) not in self.walls):
-            self._pos = (nr, nc)
-
-        done = self._pos in self.goals
-        base_reward = self.goals.get(self._pos, -self.step_cost)
-        noise = float(np.random.normal(0.0, self.reward_noise)) if self.reward_noise > 0 else 0.0
+        add_noise = self.reward_noise > 0 and (not self.reward_noise_at_goal_only or done)
+        noise = float(np.random.normal(0.0, self.reward_noise)) if add_noise else 0.0
         reward = base_reward + noise
 
-        return self._encode(*self._pos), reward, done, {"pos": self._pos}
+        return next_state, reward, done, {"pos": self._pos}
 
     # ------------------------------------------------------------------
     @property
@@ -151,6 +173,20 @@ class NoisyGridworld(Environment):
     @property
     def n_actions(self) -> int:
         return 4
+
+    @property
+    def valid_states(self) -> list[Tuple[int, int]]:
+        """Non-wall, non-goal (row, col) cells — candidates for a random start."""
+        return [
+            (r, c)
+            for r in range(self.height)
+            for c in range(self.width)
+            if (r, c) not in self.walls and (r, c) not in self.goals
+        ]
+
+    @property
+    def goal_encoded_states(self) -> list[int]:
+        return [self._encode(r, c) for (r, c) in self.goals]
 
     # ------------------------------------------------------------------
     def _encode(self, r: int, c: int) -> int:
