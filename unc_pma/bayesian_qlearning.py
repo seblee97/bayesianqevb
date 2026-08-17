@@ -236,9 +236,15 @@ class BayesianQLearning:
     # VPI
     # ------------------------------------------------------------------
 
-    def vpi(self, state: int, action: int) -> float:
-        """Value of perfect information for Q(state, action)."""
-        means = self.q_means(state)
+    def vpi(self, state: int, action: int, means: np.ndarray | None = None) -> float:
+        """Value of perfect information for Q(state, action).
+
+        `means` lets a caller that already has `q_means(state)` (e.g. when
+        looping over every action at the same state) pass it in instead of
+        having it recomputed on every call; defaults to `self.q_means(state)`.
+        """
+        if means is None:
+            means = self.q_means(state)
         best_a = int(np.argmax(means))
         p = self._q[state][action]
 
@@ -335,4 +341,20 @@ class BayesianQLearning:
                 break
         return total_reward
 
+    def thomsom_sampling_probs(self, state: int) -> np.ndarray:
+        """Monte Carlo estimate of P(action a is best) at `state`.
+
+        Draws n_mixture_samples samples from each action's Normal-Gamma
+        posterior and returns the fraction of samples for which each
+        action attains the max — the same estimator already used by the
+        mixture-update branch of `update()`.
+        """
+        q_samples = np.column_stack([
+            ng.mu + ng.scale * np.random.standard_t(ng.df, size=self.n_mixture_samples)
+            for ng in (self._q[state][a] for a in range(self.n_actions))
+        ])  # (n_mixture_samples, n_actions)
+        best_counts = np.bincount(
+            np.argmax(q_samples, axis=1), minlength=self.n_actions
+        )
+        return best_counts / self.n_mixture_samples
 
