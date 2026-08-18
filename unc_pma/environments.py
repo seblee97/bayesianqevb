@@ -214,3 +214,113 @@ class NoisyGridworld(Environment):
                     row.append(".")
             lines.append(" ".join(row))
         return "\n".join(lines)
+
+    def maze_render(self, ax=None, show_agent: bool = True, figsize: Optional[Tuple[float, float]] = None):
+        """Draw the maze: black walls, white open cells, a grid of thin
+        lines over every cell, a mouse at the agent's current position, and
+        cheese at every goal cell.
+
+        Uses the same cell-center coordinate convention as the plotting
+        helpers in notebooks/mattar_model_run.ipynb (cell (r, c) centered at
+        (c, -r)), so backup arrows/heatmaps built for that convention can be
+        overlaid directly on top of this render.
+
+        Args:
+            ax: existing matplotlib Axes to draw into; a new figure/axes is
+                created if omitted.
+            show_agent: if False, skip drawing the mouse (e.g. to render a
+                bare maze layout without a specific agent position).
+            figsize: forwarded to plt.subplots when `ax` is None; defaults
+                to a size proportional to the grid.
+
+        Returns:
+            The Axes the maze was drawn into.
+        """
+        import matplotlib.pyplot as plt
+
+        if ax is None:
+            if figsize is None:
+                figsize = (max(3.0, self.width * 0.9), max(3.0, self.height * 0.9))
+            _, ax = plt.subplots(figsize=figsize)
+
+        for r in range(self.height):
+            for c in range(self.width):
+                face = "black" if (r, c) in self.walls else "white"
+                ax.add_patch(plt.Rectangle(
+                    (c - 0.5, -r - 0.5), 1, 1,
+                    facecolor=face, edgecolor="#333333", linewidth=1.5, zorder=1,
+                ))
+
+        for (r, c) in self.goals:
+            _draw_cheese(ax, c, -r)
+
+        if show_agent:
+            r, c = self._pos
+            _draw_mouse(ax, c, -r)
+
+        ax.set_xlim(-0.5, self.width - 0.5)
+        ax.set_ylim(-self.height + 0.5, 0.5)
+        ax.set_aspect("equal")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+        return ax
+
+
+# ---------------------------------------------------------------------------
+# maze_render icon helpers
+# ---------------------------------------------------------------------------
+
+def _draw_mouse(ax, x: float, y: float, scale: float = 0.42) -> None:
+    """Draw a simple vector mouse icon centered at (x, y)."""
+    from matplotlib.patches import Circle, Ellipse
+
+    body_color = "#9E9E9E"
+    outline = "#333333"
+
+    head_x, head_y = x - scale * 0.55, y + scale * 0.18
+
+    ax.plot(
+        [x + scale * 0.55, x + scale * 1.05], [y - scale * 0.05, y + scale * 0.3],
+        color=body_color, linewidth=1.6, solid_capstyle="round", zorder=3,
+    )
+    ax.add_patch(Ellipse(
+        (x + scale * 0.05, y - scale * 0.05), width=scale * 1.3, height=scale * 0.85,
+        facecolor=body_color, edgecolor=outline, linewidth=1.0, zorder=4,
+    ))
+    for dx, dy in [(-scale * 0.14, scale * 0.28), (-scale * 0.14, -scale * 0.28)]:
+        ax.add_patch(Circle(
+            (head_x + dx, head_y + dy), scale * 0.16,
+            facecolor=body_color, edgecolor=outline, linewidth=0.8, zorder=5,
+        ))
+    ax.add_patch(Circle(
+        (head_x, head_y), scale * 0.38,
+        facecolor=body_color, edgecolor=outline, linewidth=1.0, zorder=6,
+    ))
+    ax.add_patch(Circle(
+        (head_x - scale * 0.14, head_y + scale * 0.06), scale * 0.055,
+        facecolor="black", zorder=7,
+    ))
+    ax.add_patch(Circle(
+        (head_x - scale * 0.36, head_y - scale * 0.02), scale * 0.07,
+        facecolor="#E68A9C", edgecolor=outline, linewidth=0.5, zorder=7,
+    ))
+
+
+def _draw_cheese(ax, x: float, y: float, scale: float = 0.42) -> None:
+    """Draw a simple vector cheese-wedge icon centered at (x, y)."""
+    from matplotlib.patches import Circle, Wedge
+
+    cheese_color = "#F4C430"
+    outline = "#8A6D1D"
+
+    ax.add_patch(Wedge(
+        (x, y), scale, 20, 340,
+        facecolor=cheese_color, edgecolor=outline, linewidth=1.2, zorder=4,
+    ))
+    for dx, dy, r in [(-0.32, 0.18, 0.14), (-0.05, -0.28, 0.11), (-0.42, -0.15, 0.09)]:
+        ax.add_patch(Circle(
+            (x + dx * scale, y + dy * scale), r * scale,
+            facecolor="white", edgecolor=outline, linewidth=0.6, zorder=5,
+        ))

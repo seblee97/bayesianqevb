@@ -52,6 +52,23 @@ class ReplaySamplerAgent(object):
             (Monte Carlo P(a is best) from the Q-posteriors), 'q_means'
             (softmax over posterior mean Q-values), or 'greedy' (one-hot
             over argmax posterior mean Q-values).
+        valid_states: boolean array of shape (n_states,), True for states
+            the agent can actually occupy (e.g. non-wall cells). States
+            marked False are masked out of every EVB-based selection —
+            compute_all_evb forces their row to a large negative sentinel
+            so sample_tree_node's softmax gives them exactly zero
+            probability of being picked as a fresh root. Left at its
+            default (None), every state is treated as valid.
+            Masking root selection alone is enough: if the transition
+            model also assigns exactly zero probability to landing on an
+            invalid state (as it should, since it's unreachable), an
+            invalid state can then never become the search tree's current
+            node via forward/backward expansion either — only via root
+            sampling, which this closes off. Do NOT use `-inf` for the
+            sentinel: expected_next_state_evb/expected_prev_state_evb
+            multiply all_s_a_evb elementwise against a transition
+            probability that is legitimately exactly 0 at an unreachable
+            destination, and 0 * -inf = nan.
 
     Attributes:
         search_tree: simulated trajectories explored so far this bout, reset
@@ -70,6 +87,7 @@ class ReplaySamplerAgent(object):
         H: int = 1,
         agent_real_state: int = 0,
         SR_policy: SRPolicy = "greedy",
+        valid_states: np.ndarray | None = None,
     ):
         self.q_model = q_model
         self.transition_model = transition_model
@@ -78,6 +96,7 @@ class ReplaySamplerAgent(object):
         self.H = H
         self.agent_real_state = agent_real_state
         self.SR_policy = SR_policy
+        self.valid_states = valid_states
         self.search_strategies = ["root", "forward", "backward"]
 
 
@@ -112,6 +131,10 @@ class ReplaySamplerAgent(object):
             else:
                 current_state = search_tree[-1].state
                 current_action = search_tree[-1].action
+                # States already in this tree: forward/backward candidates
+                # landing back on one of these are excluded below, so a
+                # single tree never revisits a state.
+                visited_states = [sa.state for sa in search_tree]
                 # Compute expected EVB for all state action pairs that are not the last node in the tree
                 pre_average_evb = np.copy(all_s_a_evb)
                 pre_average_evb[current_state, current_action] = np.nan
@@ -138,27 +161,60 @@ class ReplaySamplerAgent(object):
                 elif search_strategy == "backward":
                     search_strategy = self.search_strategies[sample_from_boltzmann(np.array([NREVB, -1e6, BEVB]), temp=temp)]
 
-                if search_strategy == "root":
+                def flush_tree():
+                    nonlocal search_tree, tree_strategy, search_strategy
                     replay_sequences.append(search_tree)
                     sequences_strategy.append(tree_strategy)
                     tree_strategy = []
                     search_tree = []
+                    search_strategy = "root"
+
+                if search_strategy == "root":
+                    flush_tree()
 
                 elif search_strategy == "forward":
-                    next_state_action_probs = (FT_prob * F_action_prob).ravel()
-                    next_state_action_probs = next_state_action_probs / next_state_action_probs.sum()
-                    new_state_action_index = np.random.choice(next_state_action_probs.size, p=next_state_action_probs)
-                    new_state, new_action = self.state_action_from_index(new_state_action_index)
-                    search_tree.append(StateAction(new_state, new_action))
-                    tree_strategy.append(search_strategy)
+                    next_state_action_probs = (FT_prob * F_action_prob).copy()
+                    # Clause 1: never land on a state already in this tree.
+                    next_state_action_probs[visited_states, :] = 0.0
+                    # Clause 2: don't attach an action that would (on the
+                    # next forward step) walk right back into an
+                    # already-visited state -- e.g. a boundary/self-loop
+                    # bump, or doubling back the way we came. The
+                    # transition model is seeded near-deterministically, so
+                    # its argmax is a cheap, accurate stand-in for "the
+                    # state this (s, a) actually leads to."
+                    dominant_next_state = self.transition_model.alpha.argmax(axis=-1)
+                    next_state_action_probs[np.isin(dominant_next_state, visited_states)] = 0.0
+
+                    total = next_state_action_probs.sum()
+                    if total <= 0.0:
+                        # No legal, non-repeating continuation -- abandon this tree.
+                        flush_tree()
+                    else:
+                        next_state_action_probs = (next_state_action_probs / total).ravel()
+                        new_state_action_index = np.random.choice(next_state_action_probs.size, p=next_state_action_probs)
+                        new_state, new_action = self.state_action_from_index(new_state_action_index)
+                        search_tree.append(StateAction(new_state, new_action))
+                        tree_strategy.append(search_strategy)
 
                 elif search_strategy == "backward":
-                    prev_state_action_probs = (BT_prob * B_action_prob).ravel()
-                    prev_state_action_probs = prev_state_action_probs / prev_state_action_probs.sum()
-                    prev_state_action_index = np.random.choice(prev_state_action_probs.size, p=prev_state_action_probs)
-                    prev_state, prev_action = self.state_action_from_index(prev_state_action_index)
-                    search_tree.append(StateAction(prev_state, prev_action))
-                    tree_strategy.append(search_strategy)
+                    prev_state_action_probs = (BT_prob * B_action_prob).copy()
+                    # Never re-add a predecessor state already in this tree.
+                    # (No clause-2 analog here: expected_prev_state_evb
+                    # doesn't use the action at all -- BT_prob/B_action_prob
+                    # only describe *this* predecessor, not what a further
+                    # backward step from it would do.)
+                    prev_state_action_probs[visited_states, :] = 0.0
+
+                    total = prev_state_action_probs.sum()
+                    if total <= 0.0:
+                        flush_tree()
+                    else:
+                        prev_state_action_probs = (prev_state_action_probs / total).ravel()
+                        prev_state_action_index = np.random.choice(prev_state_action_probs.size, p=prev_state_action_probs)
+                        prev_state, prev_action = self.state_action_from_index(prev_state_action_index)
+                        search_tree.append(StateAction(prev_state, prev_action))
+                        tree_strategy.append(search_strategy)
 
         # If there is a search tree, include to replay sequence
         if len(search_tree) > 0:
@@ -219,19 +275,34 @@ class ReplaySamplerAgent(object):
         return sr, stationary_dist
 
     @staticmethod
-    def _stationary_distribution(t_pi: np.ndarray) -> np.ndarray:
-        """Solve for mu such that mu @ t_pi = mu and mu.sum() == 1.
+    def _stationary_distribution(t_pi: np.ndarray, n_iter: int = 10_000) -> np.ndarray:
+        """Cesaro-averaged occupancy of t_pi starting from a uniform distribution:
+        mu = mean over k=0..n_iter-1 of (uniform @ t_pi^k).
 
-        Standard linear-algebra solution: replace one row of the
-        homogeneous system (t_pi.T - I) @ mu = 0 with the normalization
-        constraint sum(mu) == 1.
+        A direct linear solve for "mu such that mu @ t_pi = mu" (replacing
+        one row of the homogeneous system with the normalization
+        constraint) only has a unique solution when t_pi is irreducible --
+        true when every (s, a) had some residual transition probability
+        everywhere, but not once transitions became exact one-hot: under a
+        deterministic policy (e.g. SR_policy="greedy") and deterministic
+        transitions, t_pi is a deterministic functional graph, which
+        generically splits into multiple disjoint cycles (a singular
+        system -- LinAlgError) and/or is periodic (plain power iteration
+        would oscillate rather than converge). Cesaro-averaging from a
+        uniform start sidesteps both: it's always well-defined (no matrix
+        inversion), converges even for periodic/reducible chains, and its
+        "expected occupancy averaged over every possible starting state"
+        reading is exactly what need_from_position=False's docstring asks
+        for -- arguably a better match than picking one arbitrary member of
+        a non-unique solution set when the chain isn't irreducible anyway.
         """
         n = t_pi.shape[0]
-        coeffs = t_pi.T - np.eye(n)
-        coeffs[-1, :] = 1.0
-        rhs = np.zeros(n)
-        rhs[-1] = 1.0
-        return np.linalg.solve(coeffs, rhs)
+        mu = np.full(n, 1.0 / n)
+        mu_sum = np.zeros(n)
+        for _ in range(n_iter):
+            mu_sum += mu
+            mu = mu @ t_pi
+        return mu_sum / n_iter
 
     def compute_all_evb(
         self,
@@ -246,6 +317,15 @@ class ReplaySamplerAgent(object):
             means = q_model.q_means(s)  # computed once per state, not once per (state, action)
             for a in range(q_model.n_actions):
                 evb[s, a] = self.compute_single_evb(q_model, transition_model, s, a, sr, stationary_dist, means=means)
+        if self.valid_states is not None:
+            # Large finite sentinel, not -inf: forward/backward sampling
+            # multiplies this elementwise against a transition probability
+            # that's legitimately exactly 0 at an unreachable destination,
+            # and 0 * -inf = nan. -1e6 already underflows softmax to exact
+            # 0 probability at this EVB scale (matches the masking sentinel
+            # used for the root/forward/backward strategy gate in
+            # sample_replay).
+            evb[~self.valid_states, :] = -1e6
         return evb
 
     def compute_single_evb(
