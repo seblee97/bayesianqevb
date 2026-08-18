@@ -100,7 +100,7 @@ class ReplaySamplerAgent(object):
         self.search_strategies = ["root", "forward", "backward"]
 
 
-    def sample_replay(self, H: int = None, temp: float = 1.0):
+    def sample_replay(self, H: int = None, temp: float = 1.0, return_logs: bool = False):
         if H is None:
             H = self.H
         search_tree = []
@@ -108,6 +108,7 @@ class ReplaySamplerAgent(object):
         sequences_strategy = []
         tree_strategy = []
         search_strategy = "root"
+        logs = {"NREVB": [], "FEVB": [], "BEVB": []} if return_logs else None
 
         # Built once, up front: neither q_model nor transition_model changes
         # while sampling simulated replay, so every EVB query this bout can
@@ -128,6 +129,10 @@ class ReplaySamplerAgent(object):
                 s, a = sample_tree_node(all_s_a_evb, temp=temp)
                 search_tree.append(StateAction(s, a))
                 tree_strategy.append(search_strategy)
+                if return_logs:
+                    logs["NREVB"].append(np.nan)
+                    logs["FEVB"].append(np.nan)
+                    logs["BEVB"].append(np.nan)
             else:
                 current_state = search_tree[-1].state
                 current_action = search_tree[-1].action
@@ -152,6 +157,11 @@ class ReplaySamplerAgent(object):
                 BEVB, BT_prob, B_action_prob = expected_prev_state_evb(self.q_model, self.transition_model,
                                                                        current_state, current_action, all_s_a_evb,
                                                                        action_probs_grid)
+
+                if return_logs:
+                    logs["NREVB"].append(NREVB)
+                    logs["FEVB"].append(FEVB)
+                    logs["BEVB"].append(BEVB)
 
                 # We selected new root, forward or backward based on their respective EVB values
                 if search_strategy == "root":
@@ -220,6 +230,8 @@ class ReplaySamplerAgent(object):
         if len(search_tree) > 0:
             replay_sequences.append(search_tree)
             sequences_strategy.append(tree_strategy)
+        if return_logs:
+            return replay_sequences, sequences_strategy, logs
         return replay_sequences, sequences_strategy
 
     def state_action_from_index(self, index: int) -> tuple[int, int]:
