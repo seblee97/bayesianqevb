@@ -158,6 +158,33 @@ class DirichletTransitionsModel:
         self.alpha[state, action, next_state] += 1.0
         self.visited[state, action] = True
 
+    def mark_dead_end(self, states) -> None:
+        """Force every `state` in `states` to self-loop under every action.
+
+        For states the agent can never actually occupy (e.g. wall cells in
+        a gridworld), the default flat `alpha_prior` is worse than merely
+        unused: a planner that looks *backward* from a real state (e.g.
+        `expected_prev_state_evb` in `ReplaySamplerAgent`) scans every
+        `(state, action)` as a candidate predecessor, including these dead
+        states. Left at the flat prior, they'd report a small but nonzero
+        posterior-mean probability of transitioning into real states --
+        which, multiplied against the large-magnitude sentinel a planner
+        typically uses to mask a dead state's own value (e.g. `-1e6` for
+        `valid_states`-excluded states), injects a spurious, wildly
+        out-of-scale contribution into that computation. Pinning `P(state |
+        state, a) = 1` for every `a` (and 0 for every other destination)
+        makes a dead state contribute exactly 0 to any real state's
+        backward-predecessor sum instead.
+
+        Call this *after* any other seeding of these states' rows, since
+        it overwrites them outright; it does not need to run after seeding
+        of *other* (non-dead) states' rows, since it only ever touches the
+        rows belonging to `states`.
+        """
+        states = np.asarray(list(states), dtype=int)
+        self.alpha[states, :, :] = 0.0
+        self.alpha[states, :, states] = 1.0
+
     # ------------------------------------------------------------------
     # Querying the model
     # ------------------------------------------------------------------
