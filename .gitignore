@@ -4,3 +4,4 @@
 .claude
 papers
 .DS_Store
+*.ipynb_checkpoints
