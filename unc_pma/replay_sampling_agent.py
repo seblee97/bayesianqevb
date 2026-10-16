@@ -12,25 +12,100 @@ Sampling in Monte-Carlo Tree Search" by Aijun Bai et al. 2018. The idea being th
 the tree search is used to look for replay trajectories that maximize EVB instead of planned trajectories
 to maximize reward. This algorithm is sort of in between the chaining calculation in Marcelo's
 paper and the tree search of Aijun.
+
+The sampler is the *selection* step of a replay loop: given the current
+beliefs it decides what to replay next. It never applies a backup itself --
+`sample_next_replay` returns one trajectory for the caller to execute, and
+beliefs are frozen while it is being chosen. `sample_replay(H)` draws many
+trajectories against the same frozen beliefs, for replay statistics.
+
+n-step trajectory EVB
+---------------------
+A trajectory (in temporal order) (s_0, a_0), ..., (s_{n-1}, a_{n-1}) backs
+up every node j toward an n-step target G_j, built from beliefs:
+
+    G_j = R(s_j, a_j) + gamma(s_{j+1}) G_{j+1}        (target_path="sampled")
+    G_{n-1} = R(s_{n-1}, a_{n-1}) + E_{s'~T}[gamma(s') V(s')]
+
+with gamma(s') = gamma * P(continue | s') from the TerminalModel, rewards
+from the RewardModel and V(s') = max_a E[Q(s', a)]. Each target carries a
+predictive mean m and epistemic variance sigma^2 (moment propagation,
+independence between nodes, Dirichlet covariance for the T-mixture at the
+bootstrap). target_path="expected" instead averages over every path T and
+the forward-search policy allow, so only the remaining length n - j matters.
+
+Gain_j is the policy improvement at s_j if Q(s_j, a_j) were updated toward
+(m, sigma^2) under `update_rule` (a *prediction*; the sampler never applies
+it), and
+
+    EVB = sum_j Need(s_j) Gain_j              (need_weighting="per_node")
+    EVB = Need(s_last) sum_j Gain_j           (need_weighting="last_node")
+
+Growing a tree compares starting a new root against the *increase* in
+trajectory EVB from extending it forward / backward, averaged over the
+candidate (s', a') under T(s'|s, a) P(a'|s'). With gain="vpi" and
+need_weighting="per_node" this reduces exactly to per-node VPI x Need,
+the original behaviour.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Literal
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize, TwoSlopeNorm
+from scipy import stats
 
-from unc_pma.bayesian_qlearning import BayesianQLearning
-from unc_pma.environment_model import DirichletTransitionsModel
+from unc_pma.bayesian_qlearning import BayesianQLearning, NormalGamma
+from unc_pma.environment_model import DirichletTransitionsModel, RewardModel, TerminalModel
 from unc_pma.replay_buffer import StateAction
 
 SRPolicy = Literal["thomson_sampling", "q_means", "greedy"]
+TargetPath = Literal["sampled", "expected"]
+NeedWeighting = Literal["per_node", "last_node"]
+GainType = Literal["vpi", "backup", "backup_x_vpi", "backup_plus_vpi", "backup_thompson"]
+UpdateRule = Literal["mean_only", "count", "precision", "model_based"]
 
 # Masking sentinel for (state, action) pairs that must never be selected.
 # Large and negative but *finite*: it is multiplied elementwise against
 # transition probabilities that are legitimately exactly 0, and
 # 0 * -inf = nan. At the EVB scale here it underflows softmax to exactly 0.
 INVALID_EVB = -1e6
+
+# Variance floor for the "precision" / "model_based" update rules, so a
+# zero-variance target still maps to a valid (if very confident) posterior.
+MIN_VARIANCE = 1e-12
+
+
+@dataclass
+class _Bout:
+    """Everything that stays fixed while beliefs are frozen for one selection.
+
+    Built by `ReplaySamplerAgent._prepare_bout`. The arrays under "backup
+    gains" are only filled when gain != "vpi".
+    """
+    sr: np.ndarray
+    stationary_dist: np.ndarray | None   # None when need_from_position (not needed)
+    need: np.ndarray                 # (n_states,) Need(s) used by every EVB query
+    all_s_a_evb: np.ndarray          # (n_states, n_actions) EVB of a fresh one-node tree
+    action_probs_grid: np.ndarray    # (n_states, n_actions) P(a'|s')
+    valid_pair_mask: np.ndarray      # (n_states, n_actions)
+    # --- backup gains -------------------------------------------------
+    vpi: np.ndarray | None = None            # (n_states, n_actions)
+    vpi_ref: float = 1.0
+    q_mu: np.ndarray | None = None           # Q posterior arrays, (n_states, n_actions)
+    q_lam: np.ndarray | None = None
+    q_alpha: np.ndarray | None = None
+    q_beta: np.ndarray | None = None
+    q_var: np.ndarray | None = None
+    r_mean: np.ndarray | None = None         # reward beliefs, (n_states, n_actions)
+    r_var: np.ndarray | None = None
+    cont_mean: np.ndarray | None = None      # (n_states,) P(continue | s')
+    cont_var: np.ndarray | None = None
+    leaf_mean: np.ndarray | None = None      # bootstrap after (s, a), (n_states, n_actions)
+    leaf_var: np.ndarray | None = None
+    expected_tables: list = field(default_factory=list)  # [(M_L, V_L)] for L = 1, 2, ...
+    ts_uniforms: np.ndarray | None = None    # (n_states, n_samples, n_actions) common random numbers
 
 
 class ReplaySamplerAgent(object):
@@ -65,6 +140,45 @@ class ReplaySamplerAgent(object):
             *actions* of an otherwise fine state, e.g. one that bumps into
             a wall or off the grid and so just self-loops. Defaults to
             all-valid.
+        reward_model: RewardModel with beliefs over E[r | s, a]. Required
+            for every gain except "vpi".
+        terminal_model: TerminalModel with beliefs over which states end
+            the episode. None means no state is terminal (the original
+            behaviour). Also discounts the successor representation.
+        target_path: how n-step targets treat future states — "sampled"
+            (along the nodes the tree search picked, with a T-mixture only
+            at the bootstrap) or "expected" (averaged over every path under
+            T and the forward-search policy P(a'|s')).
+        need_weighting: "per_node" (sum_j Need(s_j) Gain_j) or "last_node"
+            (Need of the most recently appended node times sum_j Gain_j,
+            as in Mattar & Daw and PMAagent._trajectory_evb).
+        gain: what fills the Gain slot of EVB —
+            "vpi": VPI(s, a), independent of the replay's target;
+            "backup": greedy policy improvement at s from the predicted
+                update toward the n-step target (Mattar & Daw's Gain);
+            "backup_x_vpi": backup * VPI / VPI_ref, VPI_ref the mean VPI
+                over valid pairs this bout;
+            "backup_plus_vpi": backup + gain_kappa * VPI;
+            "backup_thompson": policy improvement measured under the
+                Thompson-sampling policy, so the predicted change in
+                variance matters, not just the mean.
+        gain_kappa: weight on VPI for gain="backup_plus_vpi".
+        update_rule: how the sampler *predicts* a replay would change the
+            Q posterior (it never applies it) —
+            "mean_only": mu' = mu + eta (m - mu), variance unchanged;
+            "count": full Normal-Gamma update with m (replay as data);
+            "precision": precision-weighted fusion with N(m, sigma^2);
+            "model_based": posterior set to the target's predictive
+                (mu' = m, variance' = sigma^2).
+        eta: step size for update_rule="mean_only" (1.0 = Mattar & Daw).
+        need_across_episodes: if True (needs `terminal_model` and
+            `reset_state`), the SR and stationary distribution follow
+            entering a terminal state with a reset to `reset_state`, so
+            Need covers future episodes; if False, occupancy stops at
+            terminal states.
+        reset_state: where the agent restarts after a terminal state -- a
+            state index, or an (n_states,) distribution over start states
+            (e.g. for random starts).
 
     Invalid pairs are excluded in two different ways, and the distinction
     matters. Where the selection weight is itself derived from EVB (root
@@ -85,6 +199,16 @@ class ReplaySamplerAgent(object):
         SR_policy: SRPolicy = "greedy",
         valid_states: np.ndarray | None = None,
         valid_state_actions: np.ndarray | None = None,
+        reward_model: RewardModel | None = None,
+        terminal_model: TerminalModel | None = None,
+        target_path: TargetPath = "sampled",
+        need_weighting: NeedWeighting = "per_node",
+        gain: GainType = "vpi",
+        gain_kappa: float = 1.0,
+        update_rule: UpdateRule = "mean_only",
+        eta: float = 1.0,
+        need_across_episodes: bool = False,
+        reset_state: int | np.ndarray | None = None,
     ):
         self.q_model = q_model
         self.transition_model = transition_model
@@ -94,24 +218,247 @@ class ReplaySamplerAgent(object):
         self.SR_policy = SR_policy
         self.valid_states = valid_states
         self.valid_state_actions = valid_state_actions
+        self.reward_model = reward_model
+        self.terminal_model = terminal_model
+        self.target_path = target_path
+        self.need_weighting = need_weighting
+        self.gain = gain
+        self.gain_kappa = gain_kappa
+        self.update_rule = update_rule
+        self.eta = eta
+        self.need_across_episodes = need_across_episodes
+        self.reset_state = reset_state
         self.search_strategies = ["root", "forward", "backward"]
 
+    # ------------------------------------------------------------------
+    # Sampling
+    # ------------------------------------------------------------------
+
+    def sample_next_replay(self, temp: float = 1.0, return_logs: bool = False):
+        """Choose the next replay: one trajectory, under the current beliefs.
+
+        Grows a tree from a fresh root until the search chooses to re-root
+        (or runs out of legal moves), and returns it without applying any
+        backup -- the caller executes it and updates beliefs before asking
+        again. Returns (tree, strategy) in append order (reversed for
+        backward trees), plus per-step logs if `return_logs`.
+
+        The chosen tree's EVB is kept in `self.last_replay_evb` (e.g. for
+        an EVB threshold on executing it), and the beliefs it was chosen
+        under in `self.last_bout`, which `execute_replay` reuses.
+        """
+        self._check_config()
+        bout = self._prepare_bout(temp)
+        logs = {"NREVB": [], "FEVB": [], "BEVB": []} if return_logs else None
+        # A tree never revisits a state, so it ends within n_states
+        # extensions; the cap is only a guard.
+        max_steps = 2 * self.q_model.n_states + 2
+        tree, strategy, _ = self._grow_tree(bout, temp, max_steps, logs)
+        self.last_bout = bout
+        self.last_replay_evb = self._trajectory_evb(bout, tree, _tree_direction(strategy))
+        if return_logs:
+            return tree, strategy, logs
+        return tree, strategy
+
+    def execute_replay(self, tree: list[StateAction], strategy: list[str], bout: _Bout | None = None) -> None:
+        """Apply a replay to the Q posterior: the outer loop's step after selection.
+
+        Every node is moved toward its n-step target with `update_rule`, the
+        same update the sampler predicted when scoring it. Targets are all
+        computed from the beliefs the tree was chosen under (`bout`,
+        default `self.last_bout`), i.e. one simultaneous n-step backup.
+        Needs a reward_model, whatever the gain.
+        """
+        if self.reward_model is None:
+            raise ValueError("execute_replay builds n-step targets and needs a reward_model")
+        bout = self.last_bout if bout is None else bout
+        if bout.q_mu is None:
+            self._prepare_backup_beliefs(bout)
+        nodes = list(reversed(tree)) if _tree_direction(strategy) == "backward" else list(tree)
+        for (s, a), (m, v) in zip(nodes, self._targets(bout, nodes)):
+            mu, lam, alpha, beta = self._predicted_posterior(bout, s, a, m, v)
+            self.q_model._q[s][a] = NormalGamma(mu=float(mu), lam=float(lam), alpha=float(alpha), beta=float(beta))
 
     def sample_replay(self, H: int = None, temp: float = 1.0, return_logs: bool = False):
+        """Draw trajectories for H search steps against one frozen set of beliefs.
+
+        Useful for replay statistics; for a replay loop where each replay
+        builds on the last, use `sample_next_replay` and update beliefs in
+        between.
+        """
         if H is None:
             H = self.H
-        search_tree = []
+        self._check_config()
         replay_sequences = []
         sequences_strategy = []
-        tree_strategy = []
-        search_strategy = "root"
         logs = {"NREVB": [], "FEVB": [], "BEVB": []} if return_logs else None
 
         # Built once, up front: neither q_model nor transition_model changes
         # while sampling simulated replay, so every EVB query this bout can
         # share the same successor representation / stationary distribution.
+        bout = self._prepare_bout(temp)
+
+        steps_left = H
+        while steps_left > 0:
+            tree, strategy, used = self._grow_tree(bout, temp, steps_left, logs)
+            steps_left -= used
+            if len(tree) > 0:
+                replay_sequences.append(tree)
+                sequences_strategy.append(strategy)
+        if return_logs:
+            return replay_sequences, sequences_strategy, logs
+        return replay_sequences, sequences_strategy
+
+    def _grow_tree(self, bout: _Bout, temp: float, max_steps: int, logs: dict | None):
+        """Grow one tree for at most `max_steps` search steps.
+
+        Each step either samples a root (empty tree) or chooses between
+        re-rooting (which ends the tree, consuming the step), extending
+        forward and extending backward. Returns (tree, strategy, steps_used).
+        """
+        search_tree = []
+        tree_strategy = []
+        search_strategy = "root"
+        all_s_a_evb = bout.all_s_a_evb
+        valid_pair_mask = bout.valid_pair_mask
+
+        for step in range(max_steps):
+            if len(search_tree) == 0:
+                # Sample transition based on EVB using a softmax
+                s, a = sample_tree_node(all_s_a_evb, temp=temp)
+                search_tree.append(StateAction(s, a))
+                tree_strategy.append(search_strategy)
+                if logs is not None:
+                    logs["NREVB"].append(np.nan)
+                    logs["FEVB"].append(np.nan)
+                    logs["BEVB"].append(np.nan)
+                continue
+
+            current_state = search_tree[-1].state
+            current_action = search_tree[-1].action
+            # States already in this tree: forward/backward candidates
+            # landing back on one of these are excluded below, so a
+            # single tree never revisits a state.
+            visited_states = [sa.state for sa in search_tree]
+            # New root EVB (NREVB): expectation under the same
+            # softmax(EVB, temp) sample_tree_node would draw a fresh
+            # root from -- valid pairs only, current node excluded.
+            candidate_mask = valid_pair_mask.copy()
+            candidate_mask[current_state, current_action] = False
+            candidate_evb = all_s_a_evb[candidate_mask]
+            if candidate_evb.size == 0:
+                NREVB = INVALID_EVB  # nowhere valid left to re-root
+            else:
+                root_weights = softmax_weights(candidate_evb, temp=temp)
+                NREVB = np.sum(root_weights * candidate_evb)
+
+            # Value of each candidate extension: the EVB it would add to
+            # this tree. For per-node VPI x Need that is just the
+            # candidate's own one-node EVB, so the grid is reused as is.
+            forward_values = self._extension_values(bout, search_tree, "forward", current_state, current_action)
+            backward_values = self._extension_values(bout, search_tree, "backward", current_state, current_action)
+
+            # Compute expected next state EVB (Forward search)
+            FEVB, FT_prob, F_action_prob = expected_next_state_evb(self.transition_model,
+                                                                   current_state, current_action, forward_values,
+                                                                   bout.action_probs_grid, self.valid_state_actions)
+
+            # Compute expected previous state EVB (Backward search)
+            BEVB, BT_prob, B_action_prob = expected_prev_state_evb(self.transition_model,
+                                                                   current_state, backward_values,
+                                                                   bout.action_probs_grid, self.valid_state_actions)
+
+            if logs is not None:
+                logs["NREVB"].append(NREVB)
+                logs["FEVB"].append(FEVB)
+                logs["BEVB"].append(BEVB)
+
+            # We selected new root, forward or backward based on their respective EVB values
+            if search_strategy == "root":
+                search_strategy = self.search_strategies[sample_from_boltzmann(np.array([NREVB, FEVB, BEVB]), temp=temp)]
+            elif search_strategy == "forward":
+                search_strategy = self.search_strategies[sample_from_boltzmann(np.array([NREVB, FEVB, INVALID_EVB]), temp=temp)]
+            elif search_strategy == "backward":
+                search_strategy = self.search_strategies[sample_from_boltzmann(np.array([NREVB, INVALID_EVB, BEVB]), temp=temp)]
+
+            if search_strategy == "root":
+                return search_tree, tree_strategy, step + 1
+
+            elif search_strategy == "forward":
+                next_state_action_probs = (FT_prob * F_action_prob).copy()
+                # Clause 1: never land on a state already in this tree.
+                next_state_action_probs[visited_states, :] = 0.0
+                # Clause 2: don't attach an action that would, on the
+                # next forward step, walk right back into an
+                # already-visited state (doubling back the way we
+                # came). The transition model is seeded
+                # near-deterministically, so its argmax is a cheap,
+                # accurate stand-in for "the state this (s, a) leads to".
+                dominant_next_state = self.transition_model.alpha.argmax(axis=-1)
+                next_state_action_probs[np.isin(dominant_next_state, visited_states)] = 0.0
+
+                total = next_state_action_probs.sum()
+                if total <= 0.0:
+                    # No legal, non-repeating continuation -- abandon this tree.
+                    return search_tree, tree_strategy, step + 1
+                next_state_action_probs = (next_state_action_probs / total).ravel()
+                new_state_action_index = np.random.choice(next_state_action_probs.size, p=next_state_action_probs)
+                new_state, new_action = self.state_action_from_index(new_state_action_index)
+                search_tree.append(StateAction(new_state, new_action))
+                tree_strategy.append(search_strategy)
+
+            elif search_strategy == "backward":
+                prev_state_action_probs = (BT_prob * B_action_prob).copy()
+                # Never re-add a predecessor state already in this tree.
+                # (No clause-2 analog here: expected_prev_state_evb
+                # doesn't use the action at all -- BT_prob/B_action_prob
+                # only describe *this* predecessor, not what a further
+                # backward step from it would do.)
+                prev_state_action_probs[visited_states, :] = 0.0
+
+                total = prev_state_action_probs.sum()
+                if total <= 0.0:
+                    return search_tree, tree_strategy, step + 1
+                prev_state_action_probs = (prev_state_action_probs / total).ravel()
+                prev_state_action_index = np.random.choice(prev_state_action_probs.size, p=prev_state_action_probs)
+                prev_state, prev_action = self.state_action_from_index(prev_state_action_index)
+                search_tree.append(StateAction(prev_state, prev_action))
+                tree_strategy.append(search_strategy)
+
+        return search_tree, tree_strategy, max_steps
+
+    def state_action_from_index(self, index: int) -> tuple[int, int]:
+        """Inverse of raveling an (n_states, n_actions) array: flat index -> (state, action)."""
+        s, a = np.unravel_index(index, (self.q_model.n_states, self.q_model.n_actions))
+        return int(s), int(a)
+
+    def _check_config(self) -> None:
+        if self.gain not in ("vpi", "backup", "backup_x_vpi", "backup_plus_vpi", "backup_thompson"):
+            raise ValueError(f"Unknown gain {self.gain!r}")
+        if self.target_path not in ("sampled", "expected"):
+            raise ValueError(f"Unknown target_path {self.target_path!r}")
+        if self.need_weighting not in ("per_node", "last_node"):
+            raise ValueError(f"Unknown need_weighting {self.need_weighting!r}")
+        if self.update_rule not in ("mean_only", "count", "precision", "model_based"):
+            raise ValueError(f"Unknown update_rule {self.update_rule!r}")
+        if self.gain != "vpi" and self.reward_model is None:
+            raise ValueError(f"gain={self.gain!r} builds n-step targets and needs a reward_model")
+        if self.need_across_episodes and (self.terminal_model is None or self.reset_state is None):
+            raise ValueError("need_across_episodes=True needs a terminal_model and a reset_state")
+
+    # ------------------------------------------------------------------
+    # Per-bout precomputation
+    # ------------------------------------------------------------------
+
+    def _prepare_bout(self, temp: float) -> _Bout:
+        """Precompute every quantity that is invariant while beliefs are frozen."""
         sr, stationary_dist = self._successor_representation(temp)
-        all_s_a_evb = self.compute_all_evb(self.q_model, sr, stationary_dist)
+        need = sr[self.agent_real_state].copy() if self.need_from_position else stationary_dist.copy()
+        # Plain VPI x Need keeps the original per-pair loop (and its
+        # floating-point results) untouched.
+        all_s_a_evb = (
+            self.compute_all_evb(self.q_model, sr, stationary_dist) if self.gain == "vpi" else None
+        )
         # Also invariant for the bout: P(a'|s') for every s', used by both
         # expected_next_state_evb and expected_prev_state_evb. Sharing one
         # draw here avoids two independent (and differently noisy) Monte
@@ -124,130 +471,242 @@ class ReplaySamplerAgent(object):
         # rather than leaving their INVALID_EVB entries in the array and
         # relying on exp() underflow -- correct today, but an accident of
         # floating point rather than an exclusion.
-        valid_pair_mask = np.ones_like(all_s_a_evb, dtype=bool)
+        valid_pair_mask = np.ones((self.q_model.n_states, self.q_model.n_actions), dtype=bool)
         if self.valid_states is not None:
             valid_pair_mask[~self.valid_states, :] = False
         if self.valid_state_actions is not None:
             valid_pair_mask &= self.valid_state_actions
 
-        for h in range(H):
-            if len(search_tree) == 0:
-                # Sample transition based on EVB using a softmax
-                s, a = sample_tree_node(all_s_a_evb, temp=temp)
-                search_tree.append(StateAction(s, a))
-                tree_strategy.append(search_strategy)
-                if return_logs:
-                    logs["NREVB"].append(np.nan)
-                    logs["FEVB"].append(np.nan)
-                    logs["BEVB"].append(np.nan)
-            else:
-                current_state = search_tree[-1].state
-                current_action = search_tree[-1].action
-                # States already in this tree: forward/backward candidates
-                # landing back on one of these are excluded below, so a
-                # single tree never revisits a state.
-                visited_states = [sa.state for sa in search_tree]
-                # New root EVB (NREVB): expectation under the same
-                # softmax(EVB, temp) sample_tree_node would draw a fresh
-                # root from -- valid pairs only, current node excluded.
-                candidate_mask = valid_pair_mask.copy()
-                candidate_mask[current_state, current_action] = False
-                candidate_evb = all_s_a_evb[candidate_mask]
-                if candidate_evb.size == 0:
-                    NREVB = INVALID_EVB  # nowhere valid left to re-root
-                else:
-                    root_weights = softmax_weights(candidate_evb, temp=temp)
-                    NREVB = np.sum(root_weights * candidate_evb)
+        bout = _Bout(sr=sr, stationary_dist=stationary_dist, need=need, all_s_a_evb=all_s_a_evb,
+                     action_probs_grid=action_probs_grid, valid_pair_mask=valid_pair_mask)
+        if self.gain != "vpi":
+            self._prepare_backup_beliefs(bout)
+            bout.all_s_a_evb = self._one_node_evb(bout)
+        return bout
 
-                # Compute expected next state EVB (Forward search)
-                FEVB, FT_prob, F_action_prob = expected_next_state_evb(self.transition_model,
-                                                                       current_state, current_action, all_s_a_evb,
-                                                                       action_probs_grid, self.valid_state_actions)
+    def _prepare_backup_beliefs(self, bout: _Bout) -> None:
+        """Fill the belief arrays used to build n-step targets and backup gains."""
+        q = self.q_model
+        n_s, n_a = q.n_states, q.n_actions
+        ngs = [[q.q_params(s, a) for a in range(n_a)] for s in range(n_s)]
+        bout.q_mu = np.array([[ng.mu for ng in row] for row in ngs])
+        bout.q_lam = np.array([[ng.lam for ng in row] for row in ngs])
+        bout.q_alpha = np.array([[ng.alpha for ng in row] for row in ngs])
+        bout.q_beta = np.array([[ng.beta for ng in row] for row in ngs])
+        bout.q_var = _ng_variance(bout.q_lam, bout.q_alpha, bout.q_beta)
 
-                # Compute expected previous state EVB (Backward search)
-                BEVB, BT_prob, B_action_prob = expected_prev_state_evb(self.transition_model,
-                                                                       current_state, all_s_a_evb,
-                                                                       action_probs_grid, self.valid_state_actions)
+        if self.gain in ("backup_x_vpi", "backup_plus_vpi"):
+            bout.vpi = _vpi_grid(q, bout.q_mu, bout.q_lam, bout.q_alpha, bout.q_beta)
+            valid_vpi = bout.vpi[bout.valid_pair_mask]
+            bout.vpi_ref = float(valid_vpi.mean()) if valid_vpi.size and valid_vpi.mean() > 0 else 1.0
 
-                if return_logs:
-                    logs["NREVB"].append(NREVB)
-                    logs["FEVB"].append(FEVB)
-                    logs["BEVB"].append(BEVB)
+        bout.r_mean = self.reward_model.mean()
+        bout.r_var = self.reward_model.mean_variance()
+        if self.terminal_model is None:
+            bout.cont_mean = np.ones(n_s)
+            bout.cont_var = np.zeros(n_s)
+        else:
+            bout.cont_mean = self.terminal_model.continue_mean()
+            bout.cont_var = self.terminal_model.continue_var()
 
-                # We selected new root, forward or backward based on their respective EVB values
-                if search_strategy == "root":
-                    search_strategy = self.search_strategies[sample_from_boltzmann(np.array([NREVB, FEVB, BEVB]), temp=temp)]
-                elif search_strategy == "forward":
-                    search_strategy = self.search_strategies[sample_from_boltzmann(np.array([NREVB, FEVB, INVALID_EVB]), temp=temp)]
-                elif search_strategy == "backward":
-                    search_strategy = self.search_strategies[sample_from_boltzmann(np.array([NREVB, INVALID_EVB, BEVB]), temp=temp)]
+        # Bootstrap value V(s') = max_a E[Q(s', a)], with the variance of
+        # the greedy action's posterior.
+        greedy = bout.q_mu.argmax(axis=1)
+        u0_mean = bout.q_mu[np.arange(n_s), greedy]
+        u0_var = bout.q_var[np.arange(n_s), greedy]
+        bout.leaf_mean, bout.leaf_var = self._discounted_successor_moments(bout, u0_mean, u0_var)
 
-                def flush_tree():
-                    nonlocal search_tree, tree_strategy, search_strategy
-                    replay_sequences.append(search_tree)
-                    sequences_strategy.append(tree_strategy)
-                    tree_strategy = []
-                    search_tree = []
-                    search_strategy = "root"
+        if self.gain == "backup_thompson":
+            bout.ts_uniforms = np.random.random((n_s, q.n_mixture_samples, n_a))
 
-                if search_strategy == "root":
-                    flush_tree()
+    def _discounted_successor_moments(self, bout: _Bout, u_mean: np.ndarray, u_var: np.ndarray):
+        """Mean and epistemic variance of E_{s'~T(.|s,a)}[gamma(s') U(s')] for every (s, a).
 
-                elif search_strategy == "forward":
-                    next_state_action_probs = (FT_prob * F_action_prob).copy()
-                    # Clause 1: never land on a state already in this tree.
-                    next_state_action_probs[visited_states, :] = 0.0
-                    # Clause 2: don't attach an action that would, on the
-                    # next forward step, walk right back into an
-                    # already-visited state (doubling back the way we
-                    # came). The transition model is seeded
-                    # near-deterministically, so its argmax is a cheap,
-                    # accurate stand-in for "the state this (s, a) leads to".
-                    dominant_next_state = self.transition_model.alpha.argmax(axis=-1)
-                    next_state_action_probs[np.isin(dominant_next_state, visited_states)] = 0.0
+        Variance terms: each successor's own uncertainty (value and
+        continuation, treated as independent), plus the Dirichlet posterior
+        covariance of T for the mixture weights,
+        Var[sum_i p_i x_i] = (sum_i p_i x_i^2 - (sum_i p_i x_i)^2) / (alpha_0 + 1).
+        """
+        gamma = self.q_model.gamma
+        alpha = self.transition_model.alpha
+        alpha0 = alpha.sum(axis=-1)                          # (S, A)
+        mean_t = alpha / alpha0[..., None]                   # (S, A, S)
+        x = gamma * bout.cont_mean * u_mean                  # (S,)
+        x_var = gamma ** 2 * ((bout.cont_mean ** 2 + bout.cont_var) * u_var + bout.cont_var * u_mean ** 2)
 
-                    total = next_state_action_probs.sum()
-                    if total <= 0.0:
-                        # No legal, non-repeating continuation -- abandon this tree.
-                        flush_tree()
-                    else:
-                        next_state_action_probs = (next_state_action_probs / total).ravel()
-                        new_state_action_index = np.random.choice(next_state_action_probs.size, p=next_state_action_probs)
-                        new_state, new_action = self.state_action_from_index(new_state_action_index)
-                        search_tree.append(StateAction(new_state, new_action))
-                        tree_strategy.append(search_strategy)
+        mean = mean_t @ x
+        own_var = (mean_t ** 2) @ x_var
+        dirichlet_var = np.maximum(mean_t @ (x ** 2) - mean ** 2, 0.0) / (alpha0 + 1.0)
+        return mean, own_var + dirichlet_var
 
-                elif search_strategy == "backward":
-                    prev_state_action_probs = (BT_prob * B_action_prob).copy()
-                    # Never re-add a predecessor state already in this tree.
-                    # (No clause-2 analog here: expected_prev_state_evb
-                    # doesn't use the action at all -- BT_prob/B_action_prob
-                    # only describe *this* predecessor, not what a further
-                    # backward step from it would do.)
-                    prev_state_action_probs[visited_states, :] = 0.0
+    def _expected_targets(self, bout: _Bout, length: int) -> tuple[np.ndarray, np.ndarray]:
+        """(M_L, V_L): mean/variance of the L-step expected target for every (s, a).
 
-                    total = prev_state_action_probs.sum()
-                    if total <= 0.0:
-                        flush_tree()
-                    else:
-                        prev_state_action_probs = (prev_state_action_probs / total).ravel()
-                        prev_state_action_index = np.random.choice(prev_state_action_probs.size, p=prev_state_action_probs)
-                        prev_state, prev_action = self.state_action_from_index(prev_state_action_index)
-                        search_tree.append(StateAction(prev_state, prev_action))
-                        tree_strategy.append(search_strategy)
+        target_path="expected": Q_1 = R + E_T[gamma(s') V(s')], and
+        Q_{L+1}(s, a) = R(s, a) + E_T[gamma(s') U_L(s')] with
+        U_L(s) = sum_a pi(a|s) Q_L(s, a), pi the forward-search policy
+        P(a'|s') restricted to valid actions. Cached per bout.
+        """
+        tables = bout.expected_tables
+        if not tables:
+            tables.append((bout.r_mean + bout.leaf_mean, bout.r_var + bout.leaf_var))
+        if len(tables) < length:
+            pi = bout.action_probs_grid.copy()
+            if self.valid_state_actions is not None:
+                pi = pi * self.valid_state_actions
+            row_sum = pi.sum(axis=1, keepdims=True)
+            fallback = (
+                self.valid_state_actions.astype(float) if self.valid_state_actions is not None
+                else np.ones_like(pi)
+            )
+            fallback_sum = np.maximum(fallback.sum(axis=1, keepdims=True), 1.0)
+            pi = np.where(row_sum > 0, pi / np.where(row_sum > 0, row_sum, 1.0), fallback / fallback_sum)
+            while len(tables) < length:
+                m_prev, v_prev = tables[-1]
+                u_mean = (pi * m_prev).sum(axis=1)
+                u_var = (pi ** 2 * v_prev).sum(axis=1)
+                succ_mean, succ_var = self._discounted_successor_moments(bout, u_mean, u_var)
+                tables.append((bout.r_mean + succ_mean, bout.r_var + succ_var))
+        return tables[length - 1]
 
-        # If there is a search tree, include to replay sequence
-        if len(search_tree) > 0:
-            replay_sequences.append(search_tree)
-            sequences_strategy.append(tree_strategy)
-        if return_logs:
-            return replay_sequences, sequences_strategy, logs
-        return replay_sequences, sequences_strategy
+    # ------------------------------------------------------------------
+    # Trajectory EVB
+    # ------------------------------------------------------------------
 
-    def state_action_from_index(self, index: int) -> tuple[int, int]:
-        """Inverse of raveling an (n_states, n_actions) array: flat index -> (state, action)."""
-        s, a = np.unravel_index(index, (self.q_model.n_states, self.q_model.n_actions))
-        return int(s), int(a)
+    def _targets(self, bout: _Bout, nodes: list[StateAction]) -> list[tuple[float, float]]:
+        """(m_j, sigma^2_j) n-step target moments for every node, `nodes` in temporal order."""
+        n = len(nodes)
+        if self.target_path == "expected":
+            out = []
+            for j, (s, a) in enumerate(nodes):
+                m_table, v_table = self._expected_targets(bout, n - j)
+                out.append((float(m_table[s, a]), float(v_table[s, a])))
+            return out
+
+        gamma = self.q_model.gamma
+        s, a = nodes[-1]
+        m = float(bout.r_mean[s, a] + bout.leaf_mean[s, a])
+        v = float(bout.r_var[s, a] + bout.leaf_var[s, a])
+        out = [(m, v)]
+        for j in range(n - 2, -1, -1):
+            s, a = nodes[j]
+            s_next = nodes[j + 1].state
+            c, c_var = bout.cont_mean[s_next], bout.cont_var[s_next]
+            m_next, v_next = m, v
+            m = float(bout.r_mean[s, a] + gamma * c * m_next)
+            v = float(bout.r_var[s, a] + gamma ** 2 * ((c ** 2 + c_var) * v_next + c_var * m_next ** 2))
+            out.append((m, v))
+        return out[::-1]
+
+    def _predicted_posterior(self, bout: _Bout, s: int, a: int, m: float, v: float):
+        """(mu', lam', alpha', beta') of Q(s, a) after a replay toward target (m, v), per `update_rule`."""
+        mu, lam, alpha, beta = bout.q_mu[s, a], bout.q_lam[s, a], bout.q_alpha[s, a], bout.q_beta[s, a]
+        if self.update_rule == "mean_only":
+            return mu + self.eta * (m - mu), lam, alpha, beta
+        if self.update_rule == "count":
+            lam_new = lam + 1.0
+            return (lam * mu + m) / lam_new, lam_new, alpha + 0.5, beta + lam * (m - mu) ** 2 / (2.0 * lam_new)
+        if self.update_rule == "precision":
+            q_var = max(bout.q_var[s, a], MIN_VARIANCE)
+            v = max(v, MIN_VARIANCE)
+            new_var = 1.0 / (1.0 / q_var + 1.0 / v)
+            new_mu = new_var * (mu / q_var + m / v)
+        else:  # "model_based"
+            new_mu, new_var = m, max(v, MIN_VARIANCE)
+        return new_mu, lam, alpha, _ng_beta_for_variance(new_var, lam, alpha)
+
+    def _node_gain(self, bout: _Bout, s: int, a: int, m: float, v: float) -> float:
+        """Gain of backing up Q(s, a) toward target (m, v), per `self.gain`."""
+        if self.gain == "vpi":
+            return float(bout.vpi[s, a])
+        new_mu, new_lam, new_alpha, new_beta = self._predicted_posterior(bout, s, a, m, v)
+        q_old = bout.q_mu[s]
+        q_new = q_old.copy()
+        q_new[a] = new_mu
+
+        if self.gain == "backup_thompson":
+            pi_old = self._ts_probs(bout, s)
+            pi_new = self._ts_probs(bout, s, replace=(a, new_mu, new_lam, new_alpha, new_beta))
+            return float(np.dot(pi_new - pi_old, q_new))
+
+        # Greedy policy improvement, as in Mattar & Daw's Gain with a
+        # greedy policy: E_pi_new[Q_new] - E_pi_old[Q_new]. The old greedy
+        # policy is uniform over tied best actions (the greedy limit of
+        # M&D's softmax): breaking ties with argmax would call a backup of
+        # the arbitrarily-picked action worthless, e.g. at every state while
+        # all Q-values are still equal.
+        old_best = np.flatnonzero(q_old == q_old.max())
+        backup = float(q_new.max() - q_new[old_best].mean())
+        if self.gain == "backup":
+            return backup
+        if self.gain == "backup_x_vpi":
+            return backup * float(bout.vpi[s, a]) / bout.vpi_ref
+        return backup + self.gain_kappa * float(bout.vpi[s, a])  # "backup_plus_vpi"
+
+    def _ts_probs(self, bout: _Bout, s: int, replace=None) -> np.ndarray:
+        """P(a is best at s) under Thompson sampling, with common random numbers.
+
+        Uses the same per-state uniforms for the pre- and post-backup
+        posteriors, so their difference isn't drowned in Monte Carlo noise.
+        `replace=(a, mu, lam, alpha, beta)` swaps in one action's predicted posterior.
+        """
+        mu, lam, alpha, beta = (bout.q_mu[s].copy(), bout.q_lam[s].copy(),
+                                bout.q_alpha[s].copy(), bout.q_beta[s].copy())
+        if replace is not None:
+            a, mu[a], lam[a], alpha[a], beta[a] = replace
+        scale = np.sqrt(beta / (alpha * lam))
+        samples = mu + scale * stats.t.ppf(bout.ts_uniforms[s], df=2.0 * alpha)
+        best = np.bincount(np.argmax(samples, axis=1), minlength=len(mu))
+        return best / samples.shape[0]
+
+    def _trajectory_evb(self, bout: _Bout, tree: list[StateAction], direction: str) -> float:
+        """EVB of backing up every node of `tree` (append order) toward its n-step target."""
+        nodes = list(reversed(tree)) if direction == "backward" else list(tree)
+        if self.gain == "vpi":
+            # VPI ignores the target, so no reward/terminal beliefs are needed.
+            gains = [self.q_model.vpi(s, a) for s, a in nodes]
+        else:
+            gains = [self._node_gain(bout, s, a, m, v) for (s, a), (m, v) in zip(nodes, self._targets(bout, nodes))]
+        if self.need_weighting == "last_node":
+            return float(bout.need[tree[-1].state] * sum(gains))
+        return float(sum(bout.need[s] * g for (s, _), g in zip(nodes, gains)))
+
+    def _one_node_evb(self, bout: _Bout) -> np.ndarray:
+        """EVB of every fresh one-node tree, invalid pairs masked to INVALID_EVB."""
+        n_s, n_a = self.q_model.n_states, self.q_model.n_actions
+        evb = np.full((n_s, n_a), INVALID_EVB)
+        for s, a in zip(*np.nonzero(bout.valid_pair_mask)):
+            evb[s, a] = self._trajectory_evb(bout, [StateAction(int(s), int(a))], "forward")
+        return evb
+
+    def _extension_values(self, bout: _Bout, tree: list[StateAction], direction: str,
+                          state: int, action: int) -> np.ndarray:
+        """(n_states, n_actions) EVB added to `tree` by extending it with each (s', a').
+
+        Only candidates T can reach (successors of (state, action) going
+        forward, predecessors of `state` going backward) are evaluated;
+        the rest get 0 and carry zero weight in the FEVB/BEVB averages.
+        """
+        if self.gain == "vpi" and self.need_weighting == "per_node":
+            return bout.all_s_a_evb
+
+        mean_t = self.transition_model.alpha / self.transition_model.alpha.sum(axis=-1, keepdims=True)
+        if direction == "forward":
+            reachable = mean_t[state, action] > 0                    # (n_states,)
+            candidate_mask = bout.valid_pair_mask & reachable[:, None]
+        else:
+            candidate_mask = bout.valid_pair_mask & (mean_t[:, :, state] > 0)
+
+        values = np.zeros_like(bout.all_s_a_evb)
+        base = self._trajectory_evb(bout, tree, direction)
+        for s, a in zip(*np.nonzero(candidate_mask)):
+            extended = tree + [StateAction(int(s), int(a))]
+            values[s, a] = self._trajectory_evb(bout, extended, direction) - base
+        return values
+
+    # ------------------------------------------------------------------
+    # Need
+    # ------------------------------------------------------------------
 
     def _sr_policy_probs(self, state: int, temp: float) -> np.ndarray:
         """Action-probability row for `state` under `self.SR_policy`.
@@ -283,17 +742,40 @@ class ReplaySamplerAgent(object):
         need_from_position=False). The stationary distribution isn't
         recoverable from SR alone, so T_pi is duplicated here from
         DirichletTransitionsModel.successor_representation.
+
+        With a terminal_model, occupancy stops at terminal states:
+        SR = (I - gamma * diag(c) T_pi)^-1, c = P(continue | s). With
+        need_across_episodes, entering a terminal state is instead
+        followed by a reset to `reset_state`, in both the SR and the
+        stationary distribution.
         """
         policy_probs = np.array([
             self._sr_policy_probs(s, temp) for s in range(self.q_model.n_states)
         ])
         gamma = self.q_model.gamma
-        sr = self.transition_model.successor_representation(gamma, policy_probs)
-
         mean_t = self.transition_model.alpha / self.transition_model.alpha.sum(axis=-1, keepdims=True)
         t_pi = np.einsum("sa,sap->sp", policy_probs, mean_t)
-        stationary_dist = self._stationary_distribution(t_pi)
 
+        # The stationary distribution (10k Cesaro iterations) is only
+        # needed when Need isn't anchored at the agent's position.
+        need_stationary = not self.need_from_position
+        if self.terminal_model is None:
+            sr = self.transition_model.successor_representation(gamma, policy_probs)
+            return sr, self._stationary_distribution(t_pi) if need_stationary else None
+
+        cont = self.terminal_model.continue_mean()
+        chain = cont[:, None] * t_pi
+        if self.need_across_episodes:
+            reset = np.zeros(self.q_model.n_states)
+            if np.ndim(self.reset_state) == 0:
+                reset[int(self.reset_state)] = 1.0
+            else:
+                reset = np.asarray(self.reset_state, dtype=float) / np.sum(self.reset_state)
+            chain += (1.0 - cont)[:, None] * reset[None, :]
+            stationary_dist = self._stationary_distribution(chain) if need_stationary else None
+        else:
+            stationary_dist = self._stationary_distribution(t_pi) if need_stationary else None
+        sr = np.linalg.inv(np.eye(self.q_model.n_states) - gamma * chain)
         return sr, stationary_dist
 
     @staticmethod
@@ -643,3 +1125,61 @@ def sample_from_boltzmann(values: np.ndarray, temp: float = 1.0) -> int:
     """Sample an index from softmax(values, temp). `values` are raw scores, not probabilities."""
     weights = softmax_weights(values, temp=temp)
     return int(np.random.choice(values.size, p=weights))
+
+def _tree_direction(strategy: list[str]) -> str:
+    """'backward' if any node was added backward (the tree is then stored reversed), else 'forward'."""
+    return "backward" if "backward" in strategy else "forward"
+
+
+def _vpi_grid(q_model: BayesianQLearning, mu: np.ndarray, lam: np.ndarray,
+              alpha: np.ndarray, beta: np.ndarray) -> np.ndarray:
+    """BayesianQLearning.vpi for every (s, a) at once.
+
+    Same closed forms as NormalGamma.expected_improvement / expected_shortfall
+    (put option for the greedy action against the second best, call option
+    for the others against the best); the rare df <= 1 pairs fall back to the
+    scalar method's quadrature.
+    """
+    n_s, n_a = mu.shape
+    rows = np.arange(n_s)
+    best = mu.argmax(axis=1)
+    best_val = mu[rows, best]
+    others = mu.copy()
+    others[rows, best] = -np.inf
+    second_val = others.max(axis=1) if n_a > 1 else np.full(n_s, -np.inf)
+
+    is_best = np.zeros_like(mu, dtype=bool)
+    is_best[rows, best] = True
+    threshold = np.where(is_best, second_val[:, None], best_val[:, None])
+
+    nu = 2.0 * alpha
+    scale = np.sqrt(beta / (alpha * lam))
+    z = (threshold - mu) / scale
+    pdf_z = stats.t.pdf(z, df=nu)
+    cdf_z = stats.t.cdf(z, df=nu)
+    tail = scale * nu / np.maximum(nu - 1.0, 1e-12) * pdf_z * (1.0 + z ** 2 / nu)
+    vpi = np.where(is_best, (threshold - mu) * cdf_z + tail, (mu - threshold) * (1.0 - cdf_z) + tail)
+
+    for s, a in zip(*np.nonzero(nu <= 1.0)):
+        vpi[s, a] = q_model.vpi(int(s), int(a), means=mu[s])
+    return vpi
+
+
+def _ng_variance(lam: np.ndarray, alpha: np.ndarray, beta: np.ndarray) -> np.ndarray:
+    """Marginal variance of Normal-Gamma posteriors, elementwise.
+
+    Infinite for alpha <= 1 (Student-t with df <= 2); there the squared
+    t-scale beta / (alpha * lam) stands in, so moment propagation stays finite.
+    """
+    return np.where(
+        alpha > 1.0,
+        beta / (np.maximum(alpha - 1.0, 1e-12) * lam),
+        beta / (alpha * lam),
+    )
+
+
+def _ng_beta_for_variance(variance: float, lam: float, alpha: float) -> float:
+    """Gamma rate that gives a Normal-Gamma (lam, alpha) the target marginal variance; inverse of _ng_variance."""
+    if alpha > 1.0:
+        return variance * (alpha - 1.0) * lam
+    return variance * alpha * lam
