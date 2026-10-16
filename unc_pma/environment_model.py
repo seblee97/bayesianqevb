@@ -10,6 +10,8 @@ transitions/rewards) without changing the planner itself.
 """
 from __future__ import annotations
 
+from typing import Literal
+
 import numpy as np
 
 
@@ -226,3 +228,157 @@ class DirichletTransitionsModel:
         mean_t = self.alpha / self.alpha.sum(axis=-1, keepdims=True)
         t_pi = np.einsum("sa,sap->sp", policy_probs, mean_t)
         return np.linalg.inv(np.eye(self.n_states) - gamma * t_pi)
+
+
+class RewardModel:
+    """Posterior over the expected immediate reward E[r | s, a], one per (s, a).
+
+    Replay builds n-step targets from rewards the agent *believes* it would
+    collect, so the replay sampler needs beliefs over R alongside the
+    Dirichlet beliefs over T. Two observation models are offered:
+
+      - noise="unknown" (default): Normal-Gamma over (mean, precision) of
+        the reward, the same conjugate family as the Q posteriors
+        (unc_pma.bayesian_qlearning.NormalGamma), so the reward noise level
+        is learned rather than supplied.
+      - noise="known": Normal over the mean with a fixed observation noise
+        variance `noise_var`, e.g. the environment's reward_noise ** 2.
+
+    Either way, what replay consumes is the posterior over the *mean*
+    reward: `mean()` and `mean_variance()`, the epistemic variance of
+    E[r | s, a] (not the spread of individual rewards).
+
+    Args:
+        n_states, n_actions: size of the discrete state/action space.
+        noise: "unknown" or "known", see above.
+        noise_var: observation noise variance, only used if noise="known".
+        mu0, lam0: prior mean and pseudo-count shared by both models.
+        alpha0, beta0: Normal-Gamma Gamma shape/rate, only used if
+            noise="unknown". The default alpha0=2 keeps the marginal
+            variance finite before any observation.
+    """
+
+    def __init__(
+        self,
+        n_states: int,
+        n_actions: int,
+        noise: Literal["unknown", "known"] = "unknown",
+        noise_var: float = 1.0,
+        mu0: float = 0.0,
+        lam0: float = 1.0,
+        alpha0: float = 2.0,
+        beta0: float = 1.0,
+    ):
+        if noise not in ("unknown", "known"):
+            raise ValueError(f"Unknown noise model {noise!r}")
+        self.n_states = n_states
+        self.n_actions = n_actions
+        self.noise = noise
+        self.noise_var = noise_var
+
+        self.mu = np.full((n_states, n_actions), float(mu0))
+        self.lam = np.full((n_states, n_actions), float(lam0))
+        self.alpha = np.full((n_states, n_actions), float(alpha0))
+        self.beta = np.full((n_states, n_actions), float(beta0))
+
+    def update(self, state: int, action: int, reward: float) -> None:
+        """Conjugate update of the (state, action) posterior with one observed reward.
+
+        Same update as NormalGamma.update; the known-noise model only moves
+        mu and lam.
+        """
+        mu, lam = self.mu[state, action], self.lam[state, action]
+        lam_new = lam + 1.0
+        if self.noise == "unknown":
+            self.alpha[state, action] += 0.5
+            self.beta[state, action] += lam * (reward - mu) ** 2 / (2.0 * lam_new)
+        self.mu[state, action] = (lam * mu + reward) / lam_new
+        self.lam[state, action] = lam_new
+
+    def mean(self) -> np.ndarray:
+        """(n_states, n_actions) posterior mean of E[r | s, a]."""
+        return self.mu
+
+    def mean_variance(self) -> np.ndarray:
+        """(n_states, n_actions) posterior variance of E[r | s, a].
+
+        Normal-Gamma: variance of the Student-t marginal of the mean,
+        beta / ((alpha - 1) * lam). It is infinite for alpha <= 1, where the
+        squared t-scale beta / (alpha * lam) is used instead so it stays
+        usable in moment propagation.
+        """
+        if self.noise == "known":
+            return self.noise_var / self.lam
+        return np.where(
+            self.alpha > 1.0,
+            self.beta / (np.maximum(self.alpha - 1.0, 1e-12) * self.lam),
+            self.beta / (self.alpha * self.lam),
+        )
+
+
+class TerminalModel:
+    """Belief over which states end the episode when entered.
+
+    Replay rolls out the agent's model, not the environment, so no `done`
+    flag arrives during a rollout; whether entering s' ends the episode has
+    to come from beliefs. It is consumed as a transition-dependent discount
+    gamma(s') = gamma * P(continue | s'), which is 0 at a terminal state
+    (White 2017, "Unifying Task Specification in Reinforcement Learning").
+    Combined with the transition posterior, the effective discount of
+    (s, a) is gamma * sum_s' T(s'|s, a) P(continue | s'), so uncertainty
+    about *reaching* a terminal comes from T for free.
+
+    Two modes:
+      - mode="known" (default): `terminal_states` (boolean mask or indices)
+        is taken as known. P(continue) is 0 there and 1 elsewhere.
+      - mode="learned": a Beta(a, b) belief per state over P(terminal),
+        updated from the `done` flags of real transitions via `update()`.
+        The default prior (a0=1e-3, b0=1) starts every state as almost
+        certainly non-terminal.
+    """
+
+    def __init__(
+        self,
+        n_states: int,
+        mode: Literal["known", "learned"] = "known",
+        terminal_states=None,
+        a0: float = 1e-3,
+        b0: float = 1.0,
+    ):
+        if mode not in ("known", "learned"):
+            raise ValueError(f"Unknown terminal mode {mode!r}")
+        self.n_states = n_states
+        self.mode = mode
+
+        self.terminal = np.zeros(n_states, dtype=bool)
+        if terminal_states is not None:
+            terminal_states = np.asarray(terminal_states)
+            if terminal_states.dtype == bool:
+                self.terminal = terminal_states.copy()
+            else:
+                self.terminal[terminal_states.astype(int)] = True
+
+        self.a = np.full(n_states, float(a0))
+        self.b = np.full(n_states, float(b0))
+
+    def update(self, next_state: int, done: bool) -> None:
+        """Record whether entering `next_state` ended the episode (learned mode only)."""
+        if self.mode != "learned":
+            return
+        if done:
+            self.a[next_state] += 1.0
+        else:
+            self.b[next_state] += 1.0
+
+    def continue_mean(self) -> np.ndarray:
+        """(n_states,) E[P(continue | s')]."""
+        if self.mode == "known":
+            return (~self.terminal).astype(float)
+        return self.b / (self.a + self.b)
+
+    def continue_var(self) -> np.ndarray:
+        """(n_states,) Var[P(continue | s')] -- zero in known mode."""
+        if self.mode == "known":
+            return np.zeros(self.n_states)
+        total = self.a + self.b
+        return self.a * self.b / (total ** 2 * (total + 1.0))
