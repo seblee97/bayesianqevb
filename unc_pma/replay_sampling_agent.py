@@ -65,6 +65,7 @@ TargetPath = Literal["sampled", "expected"]
 NeedWeighting = Literal["per_node", "last_node"]
 GainType = Literal["vpi", "backup", "backup_x_vpi", "backup_plus_vpi", "backup_thompson"]
 UpdateRule = Literal["mean_only", "count", "precision", "model_based"]
+GainPolicy = Literal["greedy", "softmax"]
 
 # Masking sentinel for (state, action) pairs that must never be selected.
 # Large and negative but *finite*: it is multiplied elementwise against
@@ -163,6 +164,22 @@ class ReplaySamplerAgent(object):
                 Thompson-sampling policy, so the predicted change in
                 variance matters, not just the mean.
         gain_kappa: weight on VPI for gain="backup_plus_vpi".
+        gain_policy: the policy whose improvement the backup gains
+            ("backup", "backup_x_vpi", "backup_plus_vpi") measure —
+            "greedy": only a backup that changes which action is best has
+                gain, so refining values along an already-correct route is
+                worth nothing;
+            "softmax": softmax(gain_beta * Q), as in Mattar & Daw's Gain;
+                raising the best action's value also makes it more likely,
+                so such refinements have small positive gain.
+        gain_beta: inverse temperature for gain_policy="softmax" (M&D: 5).
+        baseline_gain: if not None, every backup-family gain (all but
+            "vpi") is floored at this value, as in Mattar & Daw: a replay
+            that would change nothing still scores Need x baseline_gain, so
+            Need alone ranks such replays. Because the sampler draws from a
+            softmax rather than taking the argmax, the floor only lets Need
+            steer the choice if Need x baseline_gain differences are not
+            negligible next to the sampling temperature.
         update_rule: how the sampler *predicts* a replay would change the
             Q posterior (it never applies it) —
             "mean_only": mu' = mu + eta (m - mu), variance unchanged;
@@ -205,6 +222,9 @@ class ReplaySamplerAgent(object):
         need_weighting: NeedWeighting = "per_node",
         gain: GainType = "vpi",
         gain_kappa: float = 1.0,
+        gain_policy: GainPolicy = "greedy",
+        gain_beta: float = 5.0,
+        baseline_gain: float | None = None,
         update_rule: UpdateRule = "mean_only",
         eta: float = 1.0,
         need_across_episodes: bool = False,
@@ -224,6 +244,9 @@ class ReplaySamplerAgent(object):
         self.need_weighting = need_weighting
         self.gain = gain
         self.gain_kappa = gain_kappa
+        self.gain_policy = gain_policy
+        self.gain_beta = gain_beta
+        self.baseline_gain = baseline_gain
         self.update_rule = update_rule
         self.eta = eta
         self.need_across_episodes = need_across_episodes
@@ -439,6 +462,8 @@ class ReplaySamplerAgent(object):
             raise ValueError(f"Unknown target_path {self.target_path!r}")
         if self.need_weighting not in ("per_node", "last_node"):
             raise ValueError(f"Unknown need_weighting {self.need_weighting!r}")
+        if self.gain_policy not in ("greedy", "softmax"):
+            raise ValueError(f"Unknown gain_policy {self.gain_policy!r}")
         if self.update_rule not in ("mean_only", "count", "precision", "model_based"):
             raise ValueError(f"Unknown update_rule {self.update_rule!r}")
         if self.gain != "vpi" and self.reward_model is None:
@@ -616,9 +641,16 @@ class ReplaySamplerAgent(object):
         return new_mu, lam, alpha, _ng_beta_for_variance(new_var, lam, alpha)
 
     def _node_gain(self, bout: _Bout, s: int, a: int, m: float, v: float) -> float:
-        """Gain of backing up Q(s, a) toward target (m, v), per `self.gain`."""
+        """Gain of backing up Q(s, a) toward target (m, v), per `self.gain`, floored at `baseline_gain`."""
         if self.gain == "vpi":
             return float(bout.vpi[s, a])
+        gain = self._raw_node_gain(bout, s, a, m, v)
+        if self.baseline_gain is not None:
+            gain = max(gain, self.baseline_gain)
+        return gain
+
+    def _raw_node_gain(self, bout: _Bout, s: int, a: int, m: float, v: float) -> float:
+        """Unfloored backup-family gain (see `_node_gain`)."""
         new_mu, new_lam, new_alpha, new_beta = self._predicted_posterior(bout, s, a, m, v)
         q_old = bout.q_mu[s]
         q_new = q_old.copy()
@@ -629,14 +661,18 @@ class ReplaySamplerAgent(object):
             pi_new = self._ts_probs(bout, s, replace=(a, new_mu, new_lam, new_alpha, new_beta))
             return float(np.dot(pi_new - pi_old, q_new))
 
-        # Greedy policy improvement, as in Mattar & Daw's Gain with a
-        # greedy policy: E_pi_new[Q_new] - E_pi_old[Q_new]. The old greedy
-        # policy is uniform over tied best actions (the greedy limit of
-        # M&D's softmax): breaking ties with argmax would call a backup of
-        # the arbitrarily-picked action worthless, e.g. at every state while
-        # all Q-values are still equal.
-        old_best = np.flatnonzero(q_old == q_old.max())
-        backup = float(q_new.max() - q_new[old_best].mean())
+        # Mattar & Daw's Gain: E_pi_new[Q_new] - E_pi_old[Q_new].
+        if self.gain_policy == "softmax":
+            pi_old = softmax_weights(q_old, temp=1.0 / self.gain_beta)
+            pi_new = softmax_weights(q_new, temp=1.0 / self.gain_beta)
+            backup = float(np.dot(pi_new - pi_old, q_new))
+        else:
+            # The old greedy policy is uniform over tied best actions (the
+            # greedy limit of the softmax): breaking ties with argmax would
+            # call a backup of the arbitrarily-picked action worthless, e.g.
+            # at every state while all Q-values are still equal.
+            old_best = np.flatnonzero(q_old == q_old.max())
+            backup = float(q_new.max() - q_new[old_best].mean())
         if self.gain == "backup":
             return backup
         if self.gain == "backup_x_vpi":
