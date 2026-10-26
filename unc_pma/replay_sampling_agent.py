@@ -60,12 +60,13 @@ from unc_pma.bayesian_qlearning import BayesianQLearning, NormalGamma
 from unc_pma.environment_model import DirichletTransitionsModel, RewardModel, TerminalModel
 from unc_pma.replay_buffer import StateAction
 
-SRPolicy = Literal["thomson_sampling", "q_means", "greedy"]
+SRPolicy = Literal["thomson_sampling", "q_means", "greedy", "softmax"]
 TargetPath = Literal["sampled", "expected"]
 NeedWeighting = Literal["per_node", "last_node"]
 GainType = Literal["vpi", "backup", "backup_x_vpi", "backup_plus_vpi", "backup_thompson"]
 UpdateRule = Literal["mean_only", "count", "precision", "model_based"]
 GainPolicy = Literal["greedy", "softmax"]
+TargetBootstrap = Literal["policy", "path"]
 
 # Masking sentinel for (state, action) pairs that must never be selected.
 # Large and negative but *finite*: it is multiplied elementwise against
@@ -105,6 +106,9 @@ class _Bout:
     cont_var: np.ndarray | None = None
     leaf_mean: np.ndarray | None = None      # bootstrap after (s, a), (n_states, n_actions)
     leaf_var: np.ndarray | None = None
+    mean_t: np.ndarray | None = None         # posterior-mean T, (n_states, n_actions, n_states)
+    u_mean: np.ndarray | None = None         # current state values used to bootstrap, (n_states,)
+    u_var: np.ndarray | None = None
     expected_tables: list = field(default_factory=list)  # [(M_L, V_L)] for L = 1, 2, ...
     ts_uniforms: np.ndarray | None = None    # (n_states, n_samples, n_actions) common random numbers
 
@@ -129,8 +133,12 @@ class ReplaySamplerAgent(object):
         SR_policy: which policy induces the on-policy successor
             representation used for the Need term — 'thomson_sampling'
             (Monte Carlo P(a is best) from the Q-posteriors), 'q_means'
-            (softmax over posterior mean Q-values), or 'greedy' (one-hot
-            over argmax posterior mean Q-values).
+            (softmax over posterior mean Q-values at the replay
+            temperature), 'greedy' (one-hot over argmax posterior mean
+            Q-values), or 'softmax' (softmax(sr_beta * posterior means),
+            e.g. the agent's own softmax behaviour policy, as Mattar & Daw
+            use for Need).
+        sr_beta: inverse temperature for SR_policy="softmax" (M&D: 5).
         valid_states: boolean array of shape (n_states,), True for states
             the agent can actually occupy (e.g. non-wall cells). Their EVB
             rows are forced to INVALID_EVB in compute_all_evb, so they are
@@ -150,9 +158,33 @@ class ReplaySamplerAgent(object):
             (along the nodes the tree search picked, with a T-mixture only
             at the bootstrap) or "expected" (averaged over every path under
             T and the forward-search policy P(a'|s')).
-        need_weighting: "per_node" (sum_j Need(s_j) Gain_j) or "last_node"
-            (Need of the most recently appended node times sum_j Gain_j,
-            as in Mattar & Daw and PMAagent._trajectory_evb).
+        target_bootstrap: what each node's target bootstraps from, for
+            target_path="sampled" --
+            "path" (default, Mattar & Daw's n-step target): the value of
+                the next node's replayed action, as if the sampled
+                successor followed for certain, with max_a E[Q(s', a)]
+                after the last node -- i.e. the chain's rewards plus a
+                Q-learning bootstrap at its end (PMAagent._n_step_targets).
+            "policy": the value the agent would have *after* the
+                replay. Nodes are swept from the end of the trajectory
+                backward; node j's target is
+                R(s_j, a_j) + gamma * sum_s' T(s'|s_j, a_j) c(s') V'(s'),
+                where V'(s') = sum_a pi'(a|s') Q'(s', a) uses the predicted
+                post-replay Q-row for states already swept and the current
+                row elsewhere, and pi' is the gain policy (`gain_policy`).
+                The trajectory only decides which pairs are backed up and
+                in what order; every successor is weighted by T. This is
+                the plug-in for q' in EVB = sum_j Need(s_j) Gain(s_j) when
+                Gain is measured for the policy that follows the replay.
+        need_weighting: "per_node" (default; sum_j Need(s_j) Gain_j, the
+            exact form of v_new(s0) - v_old(s0); with gain="vpi" it
+            reproduces the original sampler) or "last_node" (Need of the
+            most recently appended node times sum_j Gain_j, as in Mattar &
+            Daw and PMAagent._trajectory_evb). "last_node" only behaves as
+            in M&D inside their chaining procedure: here extensions are
+            scored by the EVB they add, and re-weighting every node by the
+            new node's Need makes growing away from high-Need states score
+            negative, which suppresses forward replay before runs.
         gain: what fills the Gain slot of EVB —
             "vpi": VPI(s, a), independent of the replay's target;
             "backup": greedy policy improvement at s from the predicted
@@ -193,6 +225,13 @@ class ReplaySamplerAgent(object):
             entering a terminal state with a reset to `reset_state`, so
             Need covers future episodes; if False, occupancy stops at
             terminal states.
+        n_candidates: how many trajectories `sample_next_replay` grows before
+            choosing one. 1 (default): the single tree grown is the replay.
+            N > 1: N trees are grown independently from the same frozen
+            beliefs, each is scored by its total EVB, and the highest is
+            returned (ties to the shortest, then at random, as in Mattar &
+            Daw). With gain="vpi" scoring needs no targets, so choosing the
+            best of N still never carries out a candidate backup.
         reset_state: where the agent restarts after a terminal state -- a
             state index, or an (n_states,) distribution over start states
             (e.g. for random starts).
@@ -214,11 +253,13 @@ class ReplaySamplerAgent(object):
         H: int = 1,
         agent_real_state: int = 0,
         SR_policy: SRPolicy = "greedy",
+        sr_beta: float = 5.0,
         valid_states: np.ndarray | None = None,
         valid_state_actions: np.ndarray | None = None,
         reward_model: RewardModel | None = None,
         terminal_model: TerminalModel | None = None,
         target_path: TargetPath = "sampled",
+        target_bootstrap: TargetBootstrap = "path",
         need_weighting: NeedWeighting = "per_node",
         gain: GainType = "vpi",
         gain_kappa: float = 1.0,
@@ -229,6 +270,7 @@ class ReplaySamplerAgent(object):
         eta: float = 1.0,
         need_across_episodes: bool = False,
         reset_state: int | np.ndarray | None = None,
+        n_candidates: int = 1,
     ):
         self.q_model = q_model
         self.transition_model = transition_model
@@ -236,11 +278,13 @@ class ReplaySamplerAgent(object):
         self.H = H
         self.agent_real_state = agent_real_state
         self.SR_policy = SR_policy
+        self.sr_beta = sr_beta
         self.valid_states = valid_states
         self.valid_state_actions = valid_state_actions
         self.reward_model = reward_model
         self.terminal_model = terminal_model
         self.target_path = target_path
+        self.target_bootstrap = target_bootstrap
         self.need_weighting = need_weighting
         self.gain = gain
         self.gain_kappa = gain_kappa
@@ -251,6 +295,7 @@ class ReplaySamplerAgent(object):
         self.eta = eta
         self.need_across_episodes = need_across_episodes
         self.reset_state = reset_state
+        self.n_candidates = n_candidates
         self.search_strategies = ["root", "forward", "backward"]
 
     # ------------------------------------------------------------------
@@ -266,19 +311,42 @@ class ReplaySamplerAgent(object):
         again. Returns (tree, strategy) in append order (reversed for
         backward trees), plus per-step logs if `return_logs`.
 
+        With `n_candidates` > 1, that many trees are grown from the same
+        frozen beliefs and the one with the highest total EVB is returned
+        (ties to the shortest, then at random); the logs are the chosen
+        tree's. The EVBs of all candidates are kept in
+        `self.last_candidate_evbs`.
+
         The chosen tree's EVB is kept in `self.last_replay_evb` (e.g. for
         an EVB threshold on executing it), and the beliefs it was chosen
         under in `self.last_bout`, which `execute_replay` reuses.
         """
         self._check_config()
         bout = self._prepare_bout(temp)
-        logs = {"NREVB": [], "FEVB": [], "BEVB": []} if return_logs else None
         # A tree never revisits a state, so it ends within n_states
         # extensions; the cap is only a guard.
         max_steps = 2 * self.q_model.n_states + 2
-        tree, strategy, _ = self._grow_tree(bout, temp, max_steps, logs)
+        candidates = []
+        for _ in range(self.n_candidates):
+            logs = {"NREVB": [], "FEVB": [], "BEVB": []} if return_logs else None
+            tree, strategy, _ = self._grow_tree(bout, temp, max_steps, logs)
+            evb = self._trajectory_evb(bout, tree, _tree_direction(strategy))
+            candidates.append((tree, strategy, logs, evb))
+
+        if len(candidates) == 1:
+            best = 0
+        else:
+            evbs = np.array([c[3] for c in candidates])
+            tied = np.flatnonzero(evbs == evbs.max())
+            if len(tied) > 1:
+                lengths = np.array([len(candidates[i][0]) for i in tied])
+                tied = tied[lengths == lengths.min()]
+            best = int(np.random.choice(tied)) if len(tied) > 1 else int(tied[0])
+        tree, strategy, logs, evb = candidates[best]
+
         self.last_bout = bout
-        self.last_replay_evb = self._trajectory_evb(bout, tree, _tree_direction(strategy))
+        self.last_replay_evb = evb
+        self.last_candidate_evbs = [c[3] for c in candidates]
         if return_logs:
             return tree, strategy, logs
         return tree, strategy
@@ -460,6 +528,8 @@ class ReplaySamplerAgent(object):
             raise ValueError(f"Unknown gain {self.gain!r}")
         if self.target_path not in ("sampled", "expected"):
             raise ValueError(f"Unknown target_path {self.target_path!r}")
+        if self.target_bootstrap not in ("policy", "path"):
+            raise ValueError(f"Unknown target_bootstrap {self.target_bootstrap!r}")
         if self.need_weighting not in ("per_node", "last_node"):
             raise ValueError(f"Unknown need_weighting {self.need_weighting!r}")
         if self.gain_policy not in ("greedy", "softmax"):
@@ -468,6 +538,8 @@ class ReplaySamplerAgent(object):
             raise ValueError(f"Unknown update_rule {self.update_rule!r}")
         if self.gain != "vpi" and self.reward_model is None:
             raise ValueError(f"gain={self.gain!r} builds n-step targets and needs a reward_model")
+        if not (isinstance(self.n_candidates, (int, np.integer)) and self.n_candidates >= 1):
+            raise ValueError(f"n_candidates must be a positive integer, got {self.n_candidates!r}")
         if self.need_across_episodes and (self.terminal_model is None or self.reset_state is None):
             raise ValueError("need_across_episodes=True needs a terminal_model and a reset_state")
 
@@ -534,12 +606,19 @@ class ReplaySamplerAgent(object):
             bout.cont_mean = self.terminal_model.continue_mean()
             bout.cont_var = self.terminal_model.continue_var()
 
-        # Bootstrap value V(s') = max_a E[Q(s', a)], with the variance of
-        # the greedy action's posterior.
-        greedy = bout.q_mu.argmax(axis=1)
-        u0_mean = bout.q_mu[np.arange(n_s), greedy]
-        u0_var = bout.q_var[np.arange(n_s), greedy]
-        bout.leaf_mean, bout.leaf_var = self._discounted_successor_moments(bout, u0_mean, u0_var)
+        # Bootstrap value of each state under the current Q: the gain
+        # policy's expected value ("policy"), or max_a E[Q(s', a)] with the
+        # greedy action's variance ("path").
+        if self.target_bootstrap == "policy":
+            pi = np.array([self._gain_policy_probs(bout.q_mu[s]) for s in range(n_s)])
+            bout.u_mean = (pi * bout.q_mu).sum(axis=1)
+            bout.u_var = (pi ** 2 * bout.q_var).sum(axis=1)
+        else:
+            greedy = bout.q_mu.argmax(axis=1)
+            bout.u_mean = bout.q_mu[np.arange(n_s), greedy]
+            bout.u_var = bout.q_var[np.arange(n_s), greedy]
+        bout.leaf_mean, bout.leaf_var = self._discounted_successor_moments(bout, bout.u_mean, bout.u_var)
+        bout.mean_t = self.transition_model.alpha / self.transition_model.alpha.sum(axis=-1, keepdims=True)
 
         if self.gain == "backup_thompson":
             bout.ts_uniforms = np.random.random((n_s, q.n_mixture_samples, n_a))
@@ -608,6 +687,9 @@ class ReplaySamplerAgent(object):
                 out.append((float(m_table[s, a]), float(v_table[s, a])))
             return out
 
+        if self.target_bootstrap == "policy":
+            return self._policy_sweep_targets(bout, nodes)
+
         gamma = self.q_model.gamma
         s, a = nodes[-1]
         m = float(bout.r_mean[s, a] + bout.leaf_mean[s, a])
@@ -622,6 +704,50 @@ class ReplaySamplerAgent(object):
             v = float(bout.r_var[s, a] + gamma ** 2 * ((c ** 2 + c_var) * v_next + c_var * m_next ** 2))
             out.append((m, v))
         return out[::-1]
+
+    def _policy_sweep_targets(self, bout: _Bout, nodes: list[StateAction]) -> list[tuple[float, float]]:
+        """target_bootstrap="policy": targets from the post-replay values, swept backward in time.
+
+        Node j bootstraps from R + gamma * sum_s' T(s'|s_j, a_j) c(s') V'(s'),
+        starting from the current-Q bootstrap (`leaf_mean`) and correcting
+        it for every successor already swept, whose value is replaced by
+        its predicted post-replay value V'(s') = pi'(.|s') . Q'(s', .).
+        Variances get the same correction on each successor's own term;
+        the Dirichlet term is left at its current-Q value.
+        """
+        gamma = self.q_model.gamma
+        updated_value: dict[int, tuple[float, float]] = {}   # state -> (V', Var V') after the replay
+        out = []
+        for s, a in reversed(nodes):
+            m = float(bout.r_mean[s, a] + bout.leaf_mean[s, a])
+            v = float(bout.r_var[s, a] + bout.leaf_var[s, a])
+            t_row = bout.mean_t[s, a]
+            for s_next, (val_new, var_new) in updated_value.items():
+                p = t_row[s_next]
+                if p == 0.0:
+                    continue
+                c, c_var = bout.cont_mean[s_next], bout.cont_var[s_next]
+                m += gamma * p * c * (val_new - bout.u_mean[s_next])
+                v += gamma ** 2 * p ** 2 * (c ** 2 + c_var) * (var_new - bout.u_var[s_next])
+            v = max(v, 0.0)
+            out.append((float(m), float(v)))
+
+            # This node's predicted post-replay row, which earlier nodes bootstrap from.
+            new_mu, new_lam, new_alpha, new_beta = self._predicted_posterior(bout, s, a, m, v)
+            row_mu = bout.q_mu[s].copy()
+            row_var = bout.q_var[s].copy()
+            row_mu[a] = new_mu
+            row_var[a] = float(_ng_variance(np.array(new_lam), np.array(new_alpha), np.array(new_beta)))
+            pi_new = self._gain_policy_probs(row_mu)
+            updated_value[s] = (float(pi_new @ row_mu), float((pi_new ** 2) @ row_var))
+        return out[::-1]
+
+    def _gain_policy_probs(self, q_row: np.ndarray) -> np.ndarray:
+        """Action probabilities of the gain policy for one Q-row (greedy: uniform over tied best actions)."""
+        if self.gain_policy == "softmax":
+            return softmax_weights(q_row, temp=1.0 / self.gain_beta)
+        best = q_row == q_row.max()
+        return best / best.sum()
 
     def _predicted_posterior(self, bout: _Bout, s: int, a: int, m: float, v: float):
         """(mu', lam', alpha', beta') of Q(s, a) after a replay toward target (m, v), per `update_rule`."""
@@ -753,6 +879,8 @@ class ReplaySamplerAgent(object):
         q_means = self.q_model.q_means(state)
         if self.SR_policy == "thomson_sampling":
             return self.q_model.thomsom_sampling_probs(state)
+        elif self.SR_policy == "softmax":
+            return softmax_weights(q_means, temp=1.0 / self.sr_beta)
         elif self.SR_policy == "q_means":
             return softmax_weights(q_means, temp=temp)
         elif self.SR_policy == "greedy":
