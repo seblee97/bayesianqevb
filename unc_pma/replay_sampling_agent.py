@@ -46,11 +46,20 @@ trajectory EVB from extending it forward / backward, averaged over the
 candidate (s', a') under T(s'|s, a) P(a'|s'). With gain="vpi" and
 need_weighting="per_node" this reduces exactly to per-node VPI x Need,
 the original behaviour.
+
+Trajectory proposers
+--------------------
+*Which* candidate trajectories are considered is delegated to a
+`TrajectoryProposer`; scoring them by EVB, picking the best and executing
+it stay here, shared by every proposer. `EVBChainProposer` (the default) is
+the EVB-guided growth above. `rollout_proposer.RolloutProposer` instead
+draws posterior-sampled rollouts guided only by the beliefs, offering every
+prefix of each rollout as a candidate.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, Protocol
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize, TwoSlopeNorm
@@ -111,6 +120,41 @@ class _Bout:
     u_var: np.ndarray | None = None
     expected_tables: list = field(default_factory=list)  # [(M_L, V_L)] for L = 1, 2, ...
     ts_uniforms: np.ndarray | None = None    # (n_states, n_samples, n_actions) common random numbers
+
+
+# One candidate replay: (tree, strategy, logs). `tree` is in append order
+# (reversed for backward trees), `strategy` labels how each node was added
+# ("root", "forward" or "backward"), and `logs` is the per-step search log
+# dict when one was asked for, else None.
+Candidate = tuple[list[StateAction], list[str], dict | None]
+
+
+class TrajectoryProposer(Protocol):
+    """Proposes the candidate replays that `sample_next_replay` scores by EVB.
+
+    `n` is the agent's `n_candidates`; a proposer may return more candidates
+    than that (e.g. every prefix of each of `n` rollouts). Beliefs are frozen
+    in `bout` and must not be changed.
+    """
+
+    def propose(self, agent: ReplaySamplerAgent, bout: _Bout, temp: float, n: int,
+                return_logs: bool) -> list[Candidate]: ...
+
+
+class EVBChainProposer:
+    """The EVB-guided search: `n` independent trees from `ReplaySamplerAgent._grow_tree`."""
+
+    def propose(self, agent: ReplaySamplerAgent, bout: _Bout, temp: float, n: int,
+                return_logs: bool) -> list[Candidate]:
+        # A tree never revisits a state, so it ends within n_states
+        # extensions; the cap is only a guard.
+        max_steps = 2 * agent.q_model.n_states + 2
+        candidates = []
+        for _ in range(n):
+            logs = {"NREVB": [], "FEVB": [], "BEVB": []} if return_logs else None
+            tree, strategy, _ = agent._grow_tree(bout, temp, max_steps, logs)
+            candidates.append((tree, strategy, logs))
+        return candidates
 
 
 class ReplaySamplerAgent(object):
@@ -225,13 +269,26 @@ class ReplaySamplerAgent(object):
             entering a terminal state with a reset to `reset_state`, so
             Need covers future episodes; if False, occupancy stops at
             terminal states.
-        n_candidates: how many trajectories `sample_next_replay` grows before
-            choosing one. 1 (default): the single tree grown is the replay.
-            N > 1: N trees are grown independently from the same frozen
-            beliefs, each is scored by its total EVB, and the highest is
-            returned (ties to the shortest, then at random, as in Mattar &
-            Daw). With gain="vpi" scoring needs no targets, so choosing the
-            best of N still never carries out a candidate backup.
+        n_candidates: how many trajectories `sample_next_replay` asks the
+            proposer for before choosing one. 1 (default): with the EVB
+            chain, the single tree grown is the replay. N > 1: N trees are
+            grown independently from the same frozen beliefs, each is scored
+            by its total EVB, and the highest is returned (ties to the
+            shortest, then at random, as in Mattar & Daw). With gain="vpi"
+            scoring needs no targets, so choosing the best of N still never
+            carries out a candidate backup. For a RolloutProposer it is the
+            number of rollouts, each of whose prefixes is a candidate.
+        backup_cost: cost c per backup when choosing among candidates: the
+            replay executed maximizes EVB - c * len(tree), so a node is
+            only worth adding if it brings in more than c. Total EVB never
+            falls as nodes are added for non-negative gains, so without a
+            cost the longest candidates win. 0 (default) is pure EVB. Only
+            the choice changes: `last_replay_evb` stays the raw EVB. Has no
+            effect when the proposer returns a single candidate.
+        proposer: the TrajectoryProposer that generates candidate replays.
+            None (default) is EVBChainProposer, the EVB-guided search;
+            rollout_proposer.RolloutProposer is the belief-guided
+            alternative.
         reset_state: where the agent restarts after a terminal state -- a
             state index, or an (n_states,) distribution over start states
             (e.g. for random starts).
@@ -271,6 +328,8 @@ class ReplaySamplerAgent(object):
         need_across_episodes: bool = False,
         reset_state: int | np.ndarray | None = None,
         n_candidates: int = 1,
+        proposer: TrajectoryProposer | None = None,
+        backup_cost: float = 0.0,
     ):
         self.q_model = q_model
         self.transition_model = transition_model
@@ -296,6 +355,8 @@ class ReplaySamplerAgent(object):
         self.need_across_episodes = need_across_episodes
         self.reset_state = reset_state
         self.n_candidates = n_candidates
+        self.proposer = EVBChainProposer() if proposer is None else proposer
+        self.backup_cost = backup_cost
         self.search_strategies = ["root", "forward", "backward"]
 
     # ------------------------------------------------------------------
@@ -305,17 +366,15 @@ class ReplaySamplerAgent(object):
     def sample_next_replay(self, temp: float = 1.0, return_logs: bool = False):
         """Choose the next replay: one trajectory, under the current beliefs.
 
-        Grows a tree from a fresh root until the search chooses to re-root
-        (or runs out of legal moves), and returns it without applying any
-        backup -- the caller executes it and updates beliefs before asking
-        again. Returns (tree, strategy) in append order (reversed for
-        backward trees), plus per-step logs if `return_logs`.
-
-        With `n_candidates` > 1, that many trees are grown from the same
-        frozen beliefs and the one with the highest total EVB is returned
-        (ties to the shortest, then at random); the logs are the chosen
-        tree's. The EVBs of all candidates are kept in
-        `self.last_candidate_evbs`.
+        The proposer generates candidate trajectories (with the default EVB
+        chain: a tree grown from a fresh root until the search chooses to
+        re-root, or runs out of legal moves), and the one with the highest
+        total EVB less `backup_cost` per node is returned without applying
+        any backup -- the caller executes it and updates beliefs before
+        asking again. Ties go to the shortest, then at random. Returns (tree, strategy) in append
+        order (reversed for backward trees), plus the chosen candidate's
+        per-step logs if `return_logs`. The EVBs of all candidates are kept
+        in `self.last_candidate_evbs`.
 
         The chosen tree's EVB is kept in `self.last_replay_evb` (e.g. for
         an EVB threshold on executing it), and the beliefs it was chosen
@@ -323,21 +382,16 @@ class ReplaySamplerAgent(object):
         """
         self._check_config()
         bout = self._prepare_bout(temp)
-        # A tree never revisits a state, so it ends within n_states
-        # extensions; the cap is only a guard.
-        max_steps = 2 * self.q_model.n_states + 2
-        candidates = []
-        for _ in range(self.n_candidates):
-            logs = {"NREVB": [], "FEVB": [], "BEVB": []} if return_logs else None
-            tree, strategy, _ = self._grow_tree(bout, temp, max_steps, logs)
-            evb = self._trajectory_evb(bout, tree, _tree_direction(strategy))
-            candidates.append((tree, strategy, logs, evb))
+        candidates = [
+            (tree, strategy, logs, self._trajectory_evb(bout, tree, _tree_direction(strategy)))
+            for tree, strategy, logs in self.proposer.propose(self, bout, temp, self.n_candidates, return_logs)
+        ]
 
         if len(candidates) == 1:
             best = 0
         else:
-            evbs = np.array([c[3] for c in candidates])
-            tied = np.flatnonzero(evbs == evbs.max())
+            scores = np.array([c[3] - self.backup_cost * len(c[0]) for c in candidates])
+            tied = np.flatnonzero(scores == scores.max())
             if len(tied) > 1:
                 lengths = np.array([len(candidates[i][0]) for i in tied])
                 tied = tied[lengths == lengths.min()]
@@ -375,10 +429,12 @@ class ReplaySamplerAgent(object):
 
         Useful for replay statistics; for a replay loop where each replay
         builds on the last, use `sample_next_replay` and update beliefs in
-        between.
+        between. Always uses the EVB-chain search, whatever `proposer` is.
         """
         if H is None:
             H = self.H
+        if not isinstance(self.proposer, EVBChainProposer):
+            raise ValueError("sample_replay grows EVB-chain trees; use sample_next_replay with other proposers")
         self._check_config()
         replay_sequences = []
         sequences_strategy = []
@@ -540,6 +596,8 @@ class ReplaySamplerAgent(object):
             raise ValueError(f"gain={self.gain!r} builds n-step targets and needs a reward_model")
         if not (isinstance(self.n_candidates, (int, np.integer)) and self.n_candidates >= 1):
             raise ValueError(f"n_candidates must be a positive integer, got {self.n_candidates!r}")
+        if not self.backup_cost >= 0.0:
+            raise ValueError(f"backup_cost must be non-negative, got {self.backup_cost!r}")
         if self.need_across_episodes and (self.terminal_model is None or self.reset_state is None):
             raise ValueError("need_across_episodes=True needs a terminal_model and a reset_state")
 
